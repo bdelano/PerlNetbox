@@ -5,7 +5,7 @@ Script which can be used to interact with [Netbox](https://github.com/digitaloce
 Specifically designed to convert JSON files created from [CFG2JSON](https://github.com/bdelano/CFG2JSON).
 
 ## Usage
-See update.pl.example and updatedevice.pl.example, for inspiration.
+See update.pl.example and updatedevice.pm, for inspiration.
 
 ## Dependencies
 * Curl (could be swapped out for any perl implementation like LWP, but used here to make this as light as possible)
