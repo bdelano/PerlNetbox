@@ -1,0 +1,64 @@
+#!/usr/bin/perl
+use strict;
+use POSIX ":sys_wait_h";
+use FindBin;
+use lib $FindBin::Bin;
+use Data::Dumper;
+use CFG2JSON::BuildList;
+use updatedevice;
+my $RANCIDPATH='/root/rancid'; #path to your rancid directory
+my $PROCESSES=5; #number of concurrent processes to run
+my %custdict;
+$custdict{'site1'}='cust1';
+$custdict{'site2'}='cust1';
+$custdict{'site3'}='cust2';
+$custdict{'site4'}='cust3';
+$custdict{'site5'}='cust3';
+$custdict{'site6'}='cust3';
+
+my $d=CFG2JSON::BuildList->new({rancidpath=>$RANCIDPATH,custhash=>\%custdict}); #groups your rancid directories into a perl hash
+runForks($d->{devlist}{cust1});
+
+sub runForks{
+  my $d = shift;
+  my $i=0;
+  for(@{$d}){
+    if($i<$PROCESSES){
+      forkRemote($_);
+      $i++;
+    }else{
+      forkRemote($_);
+      my $kids;
+      print "waiting for process...\n";
+      do {
+        $kids = waitpid(-1,&WNOHANG);
+        sleep(2);
+      } until $kids==-1;
+      $i=0;
+    }
+  }
+  my $kids;
+  print "waiting for process...\n";
+  do {
+    $kids = waitpid(-1,&WNOHANG);
+    sleep(2);
+    print "kids:$kids \n";
+  } until $kids == -1;
+  print "finished forks...\n";
+}
+
+sub forkRemote {
+  my $d = shift;
+  my $dret;
+  if (my $pid = fork) {       # parent does
+    print "running ".$d->{hostname}."\n";
+  }elsif (defined $pid) {    # child does
+    unless (open F, "-|") {
+      print "attempting to execute";
+      $dret=updatedevice->new('client'=>'dev','sitename'=>$d->{sitename},'rancidpath'=>$d->{rancidpath},'hostname'=>$d->{hostname});
+    }
+      exit 0;
+    } else {
+        die "ERROR: Cannot fork: $!";
+    }
+}

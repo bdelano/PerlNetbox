@@ -1,0 +1,24 @@
+package auth;
+
+sub new{
+  my $class=shift;
+  my $client=$_[0];
+  my $auth;
+  $auth->{netbox1}{token}="netbox1keyishere";
+  $auth->{netbox1}{host}="netbox1.example.com";
+  $auth->{netbox2}{token}="netbox2keyishere";
+  $auth->{netbox2}{host}="netbox2.example.com";
+  $auth->{dev}{token}="devkeyishere";
+  $auth->{dev}{host}="dev.example.com";
+  if(!$auth->{$client}){
+    print "ERROR: invalid client $client";
+    exit;
+  }else{
+    my $self=bless ({
+      host=>$auth->{$client}{host},
+      token=>$auth->{$client}{token}
+    },$class)
+  }
+}
+
+1;
