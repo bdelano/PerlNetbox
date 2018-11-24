@@ -1,4 +1,4 @@
-package netbox;
+package PerlNetbox::netbox;
 use strict;
 use warnings;
 use Time::HiRes qw(usleep ualarm gettimeofday tv_interval);
