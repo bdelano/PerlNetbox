@@ -384,13 +384,14 @@ sub getVRFid{
     return $ret->{results}[0]{id};
   }
 }
+
 sub updateIPs{
   my ($self,$int)=@_;
   my $i=$self->{device}{interfaces}{$int};
   my $c=0;
   if($i->{ipaddress}){
     for(@{$i->{ipaddress}}){
-      my $ipret=$self->updateIP($int,$_);
+      my $ipret=$self->updateIP($int,$i,$_);
       if(!$ipret->{id}){
         push(@{$self->{error}{critical}},'ERROR: unable to update ip:'.$self->{device}{hostname}.' '.$int.' '.$_->{ip});
       }
@@ -398,58 +399,119 @@ sub updateIPs{
   }
 }
 
+
 sub updateNats{
   my $self = shift;
-  #push(@{$self->{error}},'ERROR: this is just a hold');
-  $self->info('=> updating NAT IPs...');
+  #$self->info('=> updating NAT IPs...');
+  $self->currentNAT();
   my $t0 = [gettimeofday];
+  my $ints=$self->{device}{interfaces};
+  my $cints=$self->{dcache}{interfaces};
   my $devnats=$self->{device}{nats};
   my $nbxnats=$self->{dcache}{nats};
-  my ($dev,$nbx,$natadd);
-  for(@{$nbxnats}){
-    $nbx->{$_->{local}.$_->{remote}}=$_->{description};
+  my $natobj;
+  for(keys %{$devnats}){
+    my $set=$_;
+    for(keys %{$devnats->{$set}}){
+      my $rule=$_;
+      my $rinfo=$devnats->{$set}{$rule};
+      my $crinfo=$nbxnats->{$set}{$rule};
+      if($rinfo->{type} eq 'pool'){
+        my $pn=$rinfo->{then}{pool}{name};
+        my $i=0;
+        for(@{$rinfo->{then}{pool}{addresses}}){
+          my $cai=$crinfo->{then}{pool}{addresses}[$i];
+          my $ai=$_;
+          if(!$self->{nathold}{$ai->{address}}){
+            $self->{nathold}{$ai->{address}}='hold';
+            my $description=$self->{device}{hostname}.' pool:'.$pn;
+            my ($int,$ipaddr,$bits)=('nat',$ai->{ip},$ai->{bits});
+            $int=$ai->{locint}{int} if $ai->{locint};
+            $bits=$ai->{locint}{bits} if $ai->{locint};
+            delete $self->{currentnat}{"$ipaddr/$bits"};
+            my $ip={'ip'=>$ipaddr,'bits'=>$bits,'type'=>'nat'};
+            my $no={'type'=>'pool','description'=>$description,'ip'=>$ip};
+            push(@{$natobj->{$int}},$no) if !$cai->{address} || $ai->{address} ne $cai->{address}
+          }
+          $i++;
+        }
+      }elsif($rinfo->{type} eq 'static'){
+        my $l=$rinfo->{match}{destination}[0];
+        my $r=$rinfo->{then}{static};
+        my $cl=$crinfo->{match}{destination}[0];
+        my $cr=$crinfo->{then}{static};
+        my $description=$self->{device}{hostname}.' '.$rule.' '.$l->{address}.' to '.$r->{address};
+        my ($int,$ipaddr,$bits)=('nat',$l->{ip},$l->{bits});
+        $int=$l->{locint}{int} if $l->{locint};
+        $bits=$l->{locint}{bits} if $l->{locint};
+        delete $self->{currentnat}{"$ipaddr/$bits"};
+        my $ip={'ip'=>$ipaddr,'bits'=>$bits,'type'=>'nat'};
+        my $remote={'ip'=>$r->{ip},'bits'=>$r->{bits},'type'=>'remote'};
+        my $no={'type'=>'static','description'=>$description,'ip'=>$ip,'remote'=>$remote};
+        push(@{$natobj->{$int}},$no) if $l->{address} ne $cl->{address} || $r->{address} ne $cr->{address};
+      }
+    }
   }
-  for(@{$devnats}){
-    $dev->{$_->{local}.$_->{remote}}=$_->{description};
-    push(@{$natadd},$_);# if !$nbx->{$_->{local}.$_->{remote}};
+  for(keys %{$natobj}){
+    my $int=$_;
+    if(!$ints->{$int}{id}){
+      my $intid = $self->getID('dcim/interfaces/?device_id='.$self->{device}{id}.'&name='.$int);
+      $ints->{$int}{id}=$intid;
+      $ints->{$int}{vrfid}=$self->getVRFid($int);
+    }
+    for(@{$natobj->{$int}}){
+      my $ipret=$self->updateIP($int,{'description'=>$_->{description},'vrfid'=>$ints->{$int}{vrfid},'id'=>$ints->{$int}{id}},$_->{ip});
+      my $locid=$ipret->{id};
+      push(@{$self->{error}{warning}},'ERROR: unable to get id for NAT address:'.$_->{ip}{ip}) if !$locid;
+      if($_->{type} eq 'static' && $locid){
+        my $remid=$self->updateIP($int,{'vrfid'=>$ints->{$int}{vrfid}},$_->{remote});
+        $self->goNetbox('ipam/ip-addresses',$locid,{'nat_inside'=>$remid}) if $locid && $remid;
+        push(@{$self->{error}{warning}},'ERROR: unable to get id for Remote NAT address:'.$_->{remote}{ip}) if !$remid;
+        #my $ipret=$self->updateIP($int,{'description'=>$_->{description},'vrfid'=>$ints->{$int}{vrfid},'id'=>$ints->{$int}{id}},$_->{ip});
+        #print Dumper $_;
+      }
+    }
   }
-  for(@{$natadd}){
-    my $locid=$self->getID('ipam/ip-addresses/?address='.$_->{local});
-    my $remid=$self->getID('ipam/ip-addresses/?address='.$_->{remote});
-    $self->goNetbox('ipam/ip-addresses',$locid,{'nat_inside'=>$remid}) if $locid && $remid;
-    print "locip: ".$_->{local}." locid:$locid remid:$remid \n";
+  #clean up an leftover Nat configuration:
+  for(keys %{$self->{currentnat}}){
+    #print "deleting:".$_.':'.$self->{currentnat}{$_}."\n";
+    $self->goNetbox('ipam/ip-addresses/',$self->{currentnat}{$_},'delete');
   }
-  print('=> NATs updated in '.sprintf("%.2fs\n", tv_interval ($t0)));
+  #print Dumper $natobj;
+  print('=> NAT updated in '.sprintf("%.2fs\n", tv_interval ($t0)));
 }
 
 sub updateIP{
-  my ($self,$int,$ip)=@_;
+  my ($self,$int,$i,$ip)=@_;
   my $ipbits=$ip->{ip}.'/'.$ip->{bits};
   $self->info("updating:".$int.' '.$ipbits);
-  my $i=$self->{device}{interfaces}{$int};
   my $pfinfo=$self->getPrefix($int,$ip);
+  my @except=('nat','arp','remote');
   if($i->{vrfid}){
     my $payload->{address}=$ipbits;;
     $payload->{vrf}=$i->{vrfid};
     $payload->{tenant}=$self->{device}{tenantid};
     $payload->{status}=1;
     $payload->{role}=41 if $ip->{type} eq 'vrrp';
-    $payload->{description}=$i->{description} if $i->{description};
-    $payload->{interface}=$i->{id} if $i->{id};
     my $ipq='address='.$ipbits;
     $ipq.='&vrf_id='.$i->{vrfid};
     $payload='delete' if $i->{delete};
-    my $ipid=$self->getID('ipam/ip-addresses/?'.$ipq);
-    my $ipret;
+    my $ipid;
+    my $ipret=$self->goNetbox('ipam/ip-addresses/?'.$ipq)->{results}[0];
+    $ipid=$ipret->{id} if $ipret;
     if($ip->{type} eq 'arp'  && !$ipid){
-      delete $payload->{interface};
       $payload->{description}='ARP for '.$self->{device}{hostname}.' '.$int;
       $ipret=$self->goNetbox('ipam/ip-addresses/',$ipid,$payload);
       push(@{$self->{device}{arpadded}},$ipret->{id});
-    }elsif($ip->{type} ne 'arp'){
+    }elsif($ip->{type} eq 'nat' && !$ipid){
+      $payload->{description}='NAT for '.$i->{description};
+      $ipret=$self->goNetbox('ipam/ip-addresses/',$ipid,$payload);
+      push(@{$self->{device}{natadded}},$ipret->{id});
+    }elsif(!grep(/^$ip->{type}$/,@except)){
+      $payload->{description}=$i->{description} if $i->{description};
+      $payload->{interface}=$i->{id} if $i->{id};
       $ipret=$self->goNetbox('ipam/ip-addresses/',$ipid,$payload);
     }
-
     if($ipret->{delete}){
       $ipret->{hostname}=$self->{device}{hostname};
       $ipret->{int}=$int;
@@ -526,7 +588,7 @@ sub updateConnections{
   for(keys %{$ch}){
     if(!$delhold->{$ch->{$_}}){
       $delhold->{$ch->{$_}}='deleted';
-      print "deleting:".$_."\n";
+      #print "deleting:".$_."\n";
       #my $del=$self->goNetbox('dcim/interface-connections/',$ch->{$_},'delete');
     }
   }
@@ -646,13 +708,12 @@ sub updateARP{
       for(@addarp){
         my $ipnet=$_->{ip}.'/'.$_->{bits};
         if(!$self->{currentarp}{$ipnet} && $_->{bits}){
-          $self->updateIP($int,$_);
+          $self->updateIP($int,$self->{device}{interfaces}{$int},$_);
         }
       }
     }
   }
   for(keys %{$self->{currentarp}}){
-    print "deleting:$_\n";
     $self->goNetbox('ipam/ip-addresses/',$self->{currentarp}{$_},'delete');
   }
   print('=> ARP updated in '.sprintf("%.2fs\n", tv_interval ($t0)));
@@ -664,6 +725,16 @@ sub currentArp{
   if($ret->{count}>0){
     for(@{$ret->{results}}){
       $self->{currentarp}{$_->{address}}=$_->{id};
+    }
+  }
+}
+
+sub currentNAT{
+  my $self = shift;
+  my $ret=$self->goNetbox('ipam/ip-addresses/?q=NAT for '.$self->{device}{hostname}.'&limit=1000');
+  if($ret->{count}>0){
+    for(@{$ret->{results}}){
+      $self->{currentnat}{$_->{address}}=$_->{id};
     }
   }
 }
