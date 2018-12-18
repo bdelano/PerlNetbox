@@ -174,7 +174,7 @@ sub updateDevice{
   if($devret->{id}){
     #print Dumper $devret;
     $self->info('found id!');
-    $self->{device}->{id}=$devret->{id};
+    $self->{device}{id}=$devret->{id};
     $self->{device}{siteid}=$devret->{site}{id};
     $self->{device}{siteslug}=$devret->{site}{slug};
     $self->{device}{tenantid}=$devret->{tenant}{id};
@@ -190,6 +190,7 @@ sub updateInterfaces{
   my $t0 = [gettimeofday];
   my $devints=$self->{device}{interfaces};
   my $nbxints=$self->{dcache}{interfaces};
+  $self->getcurrentInterfaces() if !$nbxints;
   my @intupdate;
   my @retints;
   my @lags;
@@ -199,12 +200,14 @@ sub updateInterfaces{
     $devdescr=$devints->{$int}{description} if $devints->{$int}{description};
     $nbxdescr=$nbxints->{$int}{description} if $nbxints->{$int}{description};
     if($devdescr ne $nbxdescr || !$nbxints->{$int}{formfactor}){
+      delete $self->{currentints}{$int};
       #print "adding:".$int.':'.$devints->{$int}{formfactor}."\n";
       push(@intupdate,$int)
     }
   }
   for my $int (keys %{$nbxints}){
     if(!$devints->{$int}){
+      print "marking $int for deletion!\n";
       $self->{device}{interfaces}{$int}{delete}='1';
       push (@intupdate,$int);
     }
@@ -217,12 +220,25 @@ sub updateInterfaces{
     #$self->getdevvlans();
     $self->getnbvlans();
     #add,delete or update interfaces
+    for(keys %{$self->{currentints}}){
+      my $delret=$self->goNetbox('dcim/interfaces/',$self->{currentints}{$_},'delete');
+      print Dumper $delret;
+    }
     for my $int (@intupdate){
       my $intret=$self->updateInt($int);
       push(@retints,$intret);
     }
+
     $self->updateLAG();
     print('=> Interfaces updated in '.sprintf("%.2fs\n", tv_interval ($t0)));
+  }
+}
+
+sub getcurrentInterfaces{
+  my $self = shift;
+  my $intret=$self->goNetbox('dcim/interfaces/?limit=1000&device_id='.$self->{device}{id})->{results};
+  for(@{$intret}){
+    $self->{currentints}{$_->{name}}=$_->{id};
   }
 }
 
@@ -251,7 +267,7 @@ sub addvlan{
   $self->getnbvlans();
   if(!$self->{nbvlanhash}{$vl}){
     my $payload->{site}=$self->{device}{siteid};
-    $payload->{vlan_id}=$vl;
+    $payload->{vid}=$vl;
     $payload->{name}="not found";
     $payload->{tenant}=$self->{device}{tenantid};
     my $vlret=$self->goNetbox('ipam/vlans/','',$payload);
@@ -589,7 +605,7 @@ sub updateConnections{
     if(!$delhold->{$ch->{$_}}){
       $delhold->{$ch->{$_}}='deleted';
       #print "deleting:".$_."\n";
-      #my $del=$self->goNetbox('dcim/interface-connections/',$ch->{$_},'delete');
+      my $del=$self->goNetbox('dcim/interface-connections/',$ch->{$_},'delete');
     }
   }
   print('=> Connections updated in '.sprintf("%.2fs\n", tv_interval ($t0)));
@@ -610,9 +626,6 @@ sub connectLLDP{
     my $altkey=$int.':'.$altrh.':'.$ri;
     $self->_removeint($int);
     if(!$connhash->{$key} && !$connhash->{$altkey}){
-      print "no connections found!\n";
-      print "key:$key\n";
-      print "rkey:$altkey\n";
       my $nbrintid=$self->getID('dcim/interfaces/?device='.$rh.'&name='.$ri);
       if(!$nbrintid){
         my $rdevid=$self->getID('dcim/devices/?q='.$rh);
@@ -664,7 +677,7 @@ sub connectMACs{
         }
       }
     }else{
-      #push(@{$self->{error}},"Connect ERROR: no match for $mac");
+      push(@{$self->{error}{warning}},"mac Connect ERROR: no match for $mac");
     }
   }
   print('==>'.$int.' MACs connected in '.sprintf("%.2fs\n", tv_interval ($t0)));
