@@ -175,9 +175,9 @@ sub updateDevice{
     #print Dumper $devret;
     $self->info('found id!');
     $self->{device}{id}=$devret->{id};
-    $self->{device}{siteid}=$devret->{site}{id};
-    $self->{device}{siteslug}=$devret->{site}{slug};
-    $self->{device}{tenantid}=$devret->{tenant}{id};
+    $self->{siteid}=$devret->{site}{id};
+    $self->{siteslug}=$devret->{site}{slug};
+    $self->{tenantid}=$devret->{tenant}{id};
   }else{
     push(@{$self->{error}{critical}},'ERROR: unable to update device:'.$self->{device}{hostname});
   }
@@ -242,22 +242,29 @@ sub getcurrentInterfaces{
   }
 }
 
-
 sub getnbvlans{
   my $self = shift;
-  my $vlaninfo=$self->goNetbox('ipam/vlans/?limit=10000&site_id='.$self->{device}{siteid});
-  my %holdhash;
-  my @holdarr;
-  for(@{$vlaninfo->{results}}){
-    my $vl=$_->{vid};
-    my $vlid=$_->{id};
-    if($self->{nbvlanhash}{$vl}){
-      my $cvlid=$self->{nbvlanhash}{$vl};
-      if($vlid<$cvlid){
-        $self->{nbvlanhash}{$vl}=$vlid
+  my $count=1;
+  my $limit=100;
+  my $i=0;
+  while($count>0){
+    my $offset=$limit * $i;
+    $i++;
+    my $vlaninfo=$self->goNetbox('ipam/vlans/?limit='.$limit.'&offset='.$offset.'&site_id='.$self->{siteid});
+    $count=scalar(@{$vlaninfo->{results}});
+    my %holdhash;
+    my @holdarr;
+    for(@{$vlaninfo->{results}}){
+      my $vl=$_->{vid};
+      my $vlid=$_->{id};
+      if($self->{nbvlanhash}{$vl}){
+        my $cvlid=$self->{nbvlanhash}{$vl};
+        if($vlid<$cvlid){
+          $self->{nbvlanhash}{$vl}=$vlid
+        }
+      }else{
+        $self->{nbvlanhash}{$vl}=$vlid;
       }
-    }else{
-      $self->{nbvlanhash}{$vl}=$vlid;
     }
   }
 }
@@ -266,12 +273,11 @@ sub addvlan{
   my ($self,$vl) = @_;
   $self->getnbvlans();
   if(!$self->{nbvlanhash}{$vl}){
-    my $payload->{site}=$self->{device}{siteid};
+    my $payload->{site}=$self->{siteid};
     $payload->{vid}=$vl;
     $payload->{name}="not found";
-    $payload->{tenant}=$self->{device}{tenantid};
+    $payload->{tenant}=$self->{tenantid};
     my $vlret=$self->goNetbox('ipam/vlans/','',$payload);
-    print "VLAN ADDED $vl \n";
     print Dumper $vlret;
     my $vlid=$vlret->{id};
     $self->{nbvlanhash}{$vl}=$vlid;
@@ -318,7 +324,9 @@ sub updateInt{
     $payload->{form_factor}=$ffid if $ffid;
     $payload->{mtu}=$i->{mtu} if $i->{mtu};
     #$payload->{tagged_vlans}=$i->{vlans} if $i->{vlans};
-    $payload->{description}=$i->{description} if $i->{description};
+    my $descr=$i->{description};
+    $descr=~s/.*(.{99})$/$1/i if $descr;#cut down to last 99 characters so it will fit
+    $payload->{description}=$descr if $descr;
     $payload->{mode}=200; #Tagged All 300,Access 100
     $payload->{tags}=[];
     if ($i->{parent}){
@@ -343,12 +351,12 @@ sub getPrefix{
   my $ninet = new NetAddr::IP $ip->{ip}.'/'.$ip->{bits};
   if($ninet->masklen()<32){
     my ($net,$bits)=split(/\//,$ninet->network);
-    my $pfkey=$net.'/'.$bits.$self->{device}{siteslug};
+    my $pfkey=$net.'/'.$bits.$self->{siteslug};
     my $ret;
     if($self->{prefixhash}{$pfkey}){
       $ret=$self->{prefixhash}{$pfkey}
     }else{
-      my $pfret=$self->goNetbox('ipam/prefixes/?contains='.$net.'&mask_length='.$bits.'&site='.$self->{device}{siteslug});
+      my $pfret=$self->goNetbox('ipam/prefixes/?contains='.$net.'&mask_length='.$bits.'&site='.$self->{siteslug});
       $ret=$pfret->{results}[0];
       my $pfid=$ret->{id};
       #if($pfret->{count}<1){ #re-enable this after everything gets updated
@@ -360,9 +368,9 @@ sub getPrefix{
           $vlanid=$self->{nbvlanhash}{$vlan};
         }
         my $payload->{prefix}=$net.'/'.$bits;
-        $payload->{site}=$self->{device}{siteid};
+        $payload->{site}=$self->{siteid};
         $payload->{vrf}=$self->{device}{interfaces}{$int}{vrfid};
-        $payload->{tenant}=$self->{device}{tenantid};
+        $payload->{tenant}=$self->{tenantid};
         $payload->{vlan}=$vlanid if $vlanid;
         $payload->{description}='isprefix';
         $payload->{is_pool}='true';
@@ -385,11 +393,11 @@ sub getVRFid{
   if(!$vrf){
     $vrfname='global';
   }else{
-    $vrfname=$self->{device}{siteslug}.' '.$vrf;
-    my $rd=$vrf.':'.$self->{device}{siteslug};
+    $vrfname=$self->{siteslug}.' '.$vrf;
+    my $rd=$vrf.':'.$self->{siteslug};
     $payload->{name}=$vrfname;
     $payload->{rd}=$rd;
-    $payload->{tenant}=$self->{device}{tenantid};
+    $payload->{tenant}=$self->{tenantid};
     $payload->{enforce_unique}='true';
   }
   my $ret=$self->goNetbox('ipam/vrfs/?q='.$vrfname);
@@ -506,7 +514,7 @@ sub updateIP{
   if($i->{vrfid}){
     my $payload->{address}=$ipbits;;
     $payload->{vrf}=$i->{vrfid};
-    $payload->{tenant}=$self->{device}{tenantid};
+    $payload->{tenant}=$self->{tenantid};
     $payload->{status}=1;
     $payload->{role}=41 if $ip->{type} eq 'vrrp';
     my $ipq='address='.$ipbits;
@@ -620,7 +628,7 @@ sub connectLLDP{
     my $rh=$_->{rh};
     my $ri=$_->{ri};
     $ri=~s/Gi/GigabitEthernet/ if $ri=~/Gi[\d]/;
-    $ri=~s/(.*)/$1.0/ if $ri=~/et-/;
+    $ri=~s/(.*)/$1.0/ if $ri=~/et-/ && $ri !~ /.*\.[\d]+$/;
     my $key=$int.':'.$rh.':'.$ri;
     my $altrh=_sub($rh);
     my $altkey=$int.':'.$altrh.':'.$ri;
