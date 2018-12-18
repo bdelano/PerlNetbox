@@ -29,7 +29,7 @@ sub new {
   my $logfile=$logdir.$args->{hostname}.'.log';
   make_path($cachedir) unless -d $cachedir; #create directory to hold our cache file
   make_path($logdir) unless -d $logdir; #create directory to hold the log output
-  open(STDOUT,">$logfile") or die $!;
+  open(STDOUT,">$logfile") or die $! if !$args->{debug};
   if(-f $cachefile){
     my $dcachejson=read_file($cachefile);
     $dcache=decode_json $dcachejson;
