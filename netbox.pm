@@ -13,20 +13,7 @@ sub new{
   $self->{ffdict}=buildffdict();
   $self->{error}{critical}=();
   $self->{error}{warning}=();
-  if($self->{altinfo}){
-    for(keys %{$self->{altinfo}}){
-      my $i=$_;
-      my $info=$self->{altinfo}{$i};
-      if($self->{device}{interfaces}{$i}){
-        $self->{device}{interfaces}{$i}{arp}=$info->{arp} if $info->{arp};
-        $self->{device}{interfaces}{$i}{lldp}=$info->{lldp} if $info->{lldp};
-        $self->{device}{interfaces}{$i}{macs}=$info->{macs} if $info->{macs};
-      }else{
-        push(@{$self->{error}{warning}},"ERROR:alt interface $i not found!");
-      }
-    }
-  }
-
+  
   if ($self->{host} && $self->{token}){
     return bless $self,$class;
   }else{

@@ -9,7 +9,6 @@ use File::Slurp;
 use File::Path qw(make_path remove_tree);
 use lib $FindBin::Bin;
 #local modules
-use CFG2JSON::Scrape;
 use PerlNetbox::netbox;
 use auth;
 sub new {
@@ -25,8 +24,8 @@ sub new {
     $cachedir=$ENV{'HOME'}.'/netbox/cache/';
     $logdir=$ENV{'HOME'}.'/netbox/logs/';
   }
-  my $cachefile=$cachedir.$args->{hostname}.'.json';
-  my $logfile=$logdir.$args->{hostname}.'.log';
+  my $cachefile=$cachedir.$args->{device}{hostname}.'.json';
+  my $logfile=$logdir.$args->{device}{hostname}.'.log';
   make_path($cachedir) unless -d $cachedir; #create directory to hold our cache file
   make_path($logdir) unless -d $logdir; #create directory to hold the log output
   open(STDOUT,">$logfile") or die $! if !$args->{debug};
@@ -35,15 +34,11 @@ sub new {
     $dcache=decode_json $dcachejson;
   }
   my $creds=auth->new($args->{client});
-  my $d=CFG2JSON::Scrape->new(
-  filepath=>$args->{rancidpath},
-  sitename=>$args->{sitename},
-  hostname=>$args->{hostname}
-  );
+
   my $nb=PerlNetbox::netbox->new(
   token=>$creds->{token},
   host=>$creds->{host},
-  device=>$d->{device},
+  device=>$args->{device},
   dcache=>$dcache,
   altinfo=>$args->{altinfo},
   debug=>$args->{debug}
@@ -52,23 +47,21 @@ sub new {
   $nb->updateDevice();
   if(!$nb->{error}{critical}){
     $nb->updateInterfaces();
-    $nb->updateNats() if $d->{device}{nats};
+    $nb->updateNats() if $args->{device}{nats};
     $nb->updateConnections();
     $nb->updateARP();
   }
 
-
   if ($nb->{error}{critical}){
-    print "ERRORS FOUND!\n";
-    print Dumper $nb->{error};
+    print "CRITICAL ERRORS FOUND NO CACHE CREATED!\n";
   }else{
-    print Dumper $nb->{error}{warning} if $nb->{error}{warning};
     open(FILE,">$cachefile") or die $!;
-    print FILE $d->json();
+    print FILE encode_json $args->{device};
+    close FILE;
     #print "json file updated!\n";
   }
   print('> Full Device updated in '.sprintf("%.2fs\n", tv_interval ($t0)));
-  return bless { (dev=>$d,nb=>$nb) },$class;
+  return bless { (dev=>$args->{device},nb=>$nb) },$class;
 }
 
 1;
