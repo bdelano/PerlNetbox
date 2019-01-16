@@ -116,7 +116,7 @@ sub getPlatform{
   my $self = shift;
   my $vendor=$self->{device}{vendor};
   print "vendor:$vendor\n";
-  my $platobj={"arista"=>"arista-eos","cisco"=>"cisco-ios","force10"=>"dell-ftos","juniper"=>"juniper-junos"};
+  my $platobj={"arista"=>"arista-eos","cisco"=>"cisco-ios","force10"=>"dell-ftos","juniper"=>"juniper-junos","opengear"=>"opengear"};
   if($platobj->{$vendor}){
     my $id=$self->getID('dcim/platforms/?slug='.$platobj->{$vendor});
     if($id){
@@ -220,12 +220,19 @@ sub updateInterfaces{
     #$self->getdevvlans();
     $self->getnbvlans();
     #add,delete or update interfaces
-    for(keys %{$self->{currentints}}){
-      my $delret=$self->goNetbox('dcim/interfaces/',$self->{currentints}{$_},'delete');
-      print Dumper $delret;
-    }
+    #for(keys %{$self->{currentints}}){
+    #  my $delret=$self->goNetbox('dcim/interfaces/',$self->{currentints}{$_},'delete');
+    #  print Dumper $delret;
+    #}
     for my $int (@intupdate){
-      my $intret=$self->updateInt($int);
+      my $intret;
+      if($self->{device}{vendor} eq 'opengear' || $int eq 'console'){
+        my $serv;
+        $serv='-server' if $int ne 'console';
+        $intret=$self->updateConsole($int,$serv)
+      }else{
+        $intret=$self->updateInt($int);
+      }
       push(@retints,$intret);
     }
 
@@ -236,7 +243,12 @@ sub updateInterfaces{
 
 sub getcurrentInterfaces{
   my $self = shift;
-  my $intret=$self->goNetbox('dcim/interfaces/?limit=1000&device_id='.$self->{device}{id})->{results};
+  my $intret;
+  if($self->{device}{vendor} eq 'opengear'){
+    $intret=$self->goNetbox('dcim/console-server-ports/?limit=1000&device_id='.$self->{device}{id})->{results};
+  }else{
+    $intret=$self->goNetbox('dcim/interfaces/?limit=1000&device_id='.$self->{device}{id})->{results};
+  }
   for(@{$intret}){
     $self->{currentints}{$_->{name}}=$_->{id};
   }
@@ -297,6 +309,44 @@ sub updateLAG{
   }
 }
 
+sub updateConsole{
+  my ($self,$int,$server)=@_;
+  my $i=$self->{device}{interfaces}{$int};
+  my $portname=$int.':'.$i->{label};
+  my $intid=$self->getID('dcim/console'.$server.'-ports/?device_id='.$self->{device}{id}.'&name='.$portname);
+  if(!$intid && $i->{delete}){
+    delete $self->{device}{interfaces}{$int};
+    return;
+  }
+  my $intret;
+  if($i->{delete}){
+    $intret=$self->goNetbox('dcim/console'.$server.'-ports/',$intid,'delete');
+    delete $self->{device}{interfaces}{$int};
+  }else{
+    my $payload->{device}=$self->{device}{id};
+    $payload->{name}=$portname;
+    $intret=$self->goNetbox('dcim/console'.$server.'-ports/',$intid,$payload);
+    if($intret->{id}){
+      if($int ne 'console'){
+        my $rmdevret=$self->goNetbox('dcim/devices/?q='.$i->{label})->{results};
+        if(@{$rmdevret}==1){
+          my $cpid=$self->getID('dcim/console-ports/?name=console&device_id='.$rmdevret->[0]{id});
+          my $payload->{cs_port}=$intret->{id};
+          $self->goNetbox('dcim/console-ports/',$cpid,$payload);
+        }elsif(@{$rmdevret}>1){
+          push(@{$self->{error}{warning}},'console:too many device matches'.@{$rmdevret}.' '.$i->{label});
+        }else{
+          push(@{$self->{error}{warning}},'console:no devices found for '.$i->{label});
+        }
+      }
+    }else{
+      push(@{$self->{error}{critical}},'ERROR: pushing console update:'.$self->{device}{hostname}.' '.$int);
+    }
+
+
+  }
+}
+
 sub updateInt{
   my ($self,$int)=@_;
   my $intid=$self->getID('dcim/interfaces/?device_id='.$self->{device}{id}.'&name='.$int);
@@ -316,12 +366,11 @@ sub updateInt{
       #print Dumper $i;
       return;
     }
-    my $ffid;
-    $ffid=$self->{ffdict}{uc($i->{formfactor})} if $i->{formfactor};
+
     my $payload->{device}=$self->{device}{id};
     $payload->{name}=$int;
     $payload->{enable}='true';
-    $payload->{form_factor}=$ffid if $ffid;
+    $payload->{form_factor}=$self->{ffdict}{uc($i->{formfactor})};
     $payload->{mtu}=$i->{mtu} if $i->{mtu};
     #$payload->{tagged_vlans}=$i->{vlans} if $i->{vlans};
     my $descr=$i->{description};
@@ -359,7 +408,7 @@ sub getPrefix{
       my $pfret=$self->goNetbox('ipam/prefixes/?contains='.$net.'&mask_length='.$bits.'&site='.$self->{siteslug});
       $ret=$pfret->{results}[0];
       my $pfid=$ret->{id};
-      #if($pfret->{count}<1){ #re-enable this after everything gets updated
+      if($pfret->{count}<1){
         my ($vlan,$vlanid);
         if($self->{device}{interfaces}{$int}{vlans}){
           $vlan=$self->{device}{interfaces}{$int}{vlans}[0];
@@ -377,9 +426,9 @@ sub getPrefix{
         $ret=$self->goNetbox('ipam/prefixes/',$pfid,$payload);
         push(@{$self->{error}{warning}},'ERROR: updating prefix:'.$net) if !$ret->{id};
         #print Dumper $ret;
-      #}else{
-      #  $ret=$pfret->{results}[0];
-      #}
+      }else{
+        $ret=$pfret->{results}[0];
+      }
       $self->{prefixhash}{$pfkey}=$ret;
     }
     return $ret;
@@ -633,7 +682,7 @@ sub connectLLDP{
     my $altrh=_sub($rh);
     my $altkey=$int.':'.$altrh.':'.$ri;
     $self->_removeint($int);
-    if(!$connhash->{$key} && !$connhash->{$altkey}){
+    if(!$connhash->{$key} && !$connhash->{$altkey} && $ri !~/([\w:]+){5}[\w]+/){
       my $nbrintid=$self->getID('dcim/interfaces/?device='.$rh.'&name='.$ri);
       if(!$nbrintid){
         my $rdevid=$self->getID('dcim/devices/?q='.$rh);
@@ -799,7 +848,11 @@ sub buildffdict{
   $ffdict{'XFP10GBASE-LR'}=1300;
   $ffdict{'XFP10GBASE-SR'}=1300;
   $ffdict{'XFP10GBASE-ZR'}=1300;
+  $ffdict{'XFP-10G-SR'}=1300;
+  $ffdict{'XFP-10G-LR'}=1300;
   $ffdict{'CAB-S-S-25G-1M'}=1350;
+  $ffdict{'CAB-S-S-25G-3M'}=1350;
+  $ffdict{'CAB-S-S-25G-2M'}=1350;
   $ffdict{'QSFP40GBASE-CR4'}=1400;
   $ffdict{'QSFP40GBASE-CR4-0.5M'}=1400;
   $ffdict{'QSFP40GBASE-CR4-1M'}=1400;
@@ -822,8 +875,10 @@ sub buildffdict{
   $ffdict{'SFP+10G-LR'}=1200;
   $ffdict{'SFP+10G-SR'}=1200;
   $ffdict{'SFP-10G-SR'}=1200;
+  $ffdict{'SFP-10G-SRL'}=1200;
   $ffdict{'SFP-10G-LR'}=1200;
   $ffdict{'SFPP30-03'}=1200;
+  $ffdict{'SFPP30-02.5'}=1200;
   $ffdict{'CAB-SFP-SFP-3M'}=1200;
   $ffdict{'CAB-SFP-SFP-2.5M'}=1200;
   $ffdict{'CAB-SFP-SFP-1.5M'}=1200;
@@ -839,6 +894,7 @@ sub buildffdict{
   $ffdict{'SFP+-10G-ER'}=1200;
   $ffdict{'SFP+-10G-SR'}=1200;
   $ffdict{'SFP+-10G-LR'}=1200;
+  $ffdict{'DCS-7048T-A'}=1200;
   $ffdict{'DUAL-SFP+-SR/SFP-SX'}=1200;
   $ffdict{'10/100/1000BASETX'}=1000;
   $ffdict{'SFP-T'}=1000;

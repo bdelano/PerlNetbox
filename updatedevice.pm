@@ -48,6 +48,7 @@ sub new {
   altinfo=>$args->{altinfo},
   debug=>$args->{debug}
   );
+
   $nb->updateDevice();
   if(!$nb->{error}{critical}){
     $nb->updateInterfaces();
