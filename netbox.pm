@@ -13,7 +13,7 @@ sub new{
   $self->{ffdict}=buildffdict();
   $self->{error}{critical}=();
   $self->{error}{warning}=();
-  
+
   if ($self->{host} && $self->{token}){
     return bless $self,$class;
   }else{
@@ -43,6 +43,7 @@ sub goNetbox{
     $rtype='POST';
     $payload=encode_json($p);
   }
+  $self->info($path);
   my $url='https://'.$self->{host}.'/api/'.uri_encode($path);
   $self->info($url);
   my $cmd='/usr/bin/curl -s -k -X '.$rtype;
@@ -103,7 +104,15 @@ sub getPlatform{
   my $self = shift;
   my $vendor=$self->{device}{vendor};
   print "vendor:$vendor\n";
-  my $platobj={"arista"=>"arista-eos","cisco"=>"cisco-ios","force10"=>"dell-ftos","juniper"=>"juniper-junos","opengear"=>"opengear"};
+  my $platobj={
+    "arista"=>"arista-eos",
+    "cisco"=>"cisco-ios",
+    "force10"=>"dell-ftos",
+    "juniper"=>"juniper-junos",
+    "opengear"=>"opengear",
+    "APC"=>"apc",
+    "Sentry"=>"sentry"
+  };
   if($platobj->{$vendor}){
     my $id=$self->getID('dcim/platforms/?slug='.$platobj->{$vendor});
     if($id){
@@ -112,7 +121,7 @@ sub getPlatform{
       push(@{$self->{error}{warning}},'ERROR:unable to find platform type:'.$vendor);
     }
   }else{
-    push(@{$self->{error}{warning}},'error: unable to match $vendor with platform:'.$vendor);
+    push(@{$self->{error}{warning}},'error: unable to match vendor with platform:'.$vendor);
   }
 
 }
@@ -165,10 +174,47 @@ sub updateDevice{
     $self->{siteid}=$devret->{site}{id};
     $self->{siteslug}=$devret->{site}{slug};
     $self->{tenantid}=$devret->{tenant}{id};
+    $self->{primary_ip}=$devret->{primary_ip4};
   }else{
     push(@{$self->{error}{critical}},'ERROR: unable to update device:'.$self->{device}{hostname});
   }
   print('=> Device updated in '.sprintf("%.2fs\n", tv_interval ($t0)));
+}
+
+sub updatePrimaryIP{
+  my $self=shift;
+  $self->info('trying to update primary IP');
+  my $ipret=$self->goNetbox('ipam/ip-addresses/?address='.$self->{device}{mgmtip})->{results};
+  if(@{$ipret}==1){
+    my $payload->{primary_ip4}=$ipret->[0]{id};
+    if(!$ipret->[0]{interface}){
+      my $intid=$self->addmgmtinterface();
+      $ipret=$self->goNetbox('ipam/ip-addresses/',$ipret->[0]{id},{interface=>$intid});
+    }
+    $self->goNetbox('dcim/devices/',$self->{device}{id},$payload);
+  }else{
+    my $pfret=$self->getHighestPrefix($self->{device}{mgmtip});
+    if(@{$ipret}<1){
+      if($pfret){
+        my $intid=$self->addmgmtinterface();
+        my $payload->{address}=$self->{device}{mgmtip}.'/'.$pfret->{bits};
+        $payload->{vrf}=$pfret->{vrf};
+        $payload->{prefix}=$pfret->{id};
+        $payload->{tenant}=$self->{tenantid};
+        $payload->{interface}=$intid;
+        $ipret=$self->goNetbox('ipam/ip-addresses/','',$payload);
+        $self->goNetbox('dcim/devices/',$self->{device}{id},{primary_ip4=>$ipret->{id}});
+      }
+    }else{
+      push(@{$self->{error}{warning}},'ERROR: unable to set mgmt ip '.$self->{device}{hostname});
+    }
+  }
+}
+
+sub addmgmtinterface{
+  my $self = shift;
+  my $intret=$self->goNetbox('dcim/interfaces/','',{name=>'mgmt',mgmt_only=>'true',device=>$self->{device}{id}});
+  return $intret->{id};
 }
 
 sub updateInterfaces{
@@ -382,6 +428,25 @@ sub updateInt{
   }
 }
 
+sub getHighestPrefix{
+  my ($self,$ip) = @_;
+  my $pfret=$self->goNetbox('ipam/prefixes/?contains='.$ip.'&site='.$self->{siteslug});
+  my $ret;
+  for(@{$pfret->{results}}){
+    my ($network,$bits)=split('/',$_->{prefix});
+    my $obj={pfid=>$_->{id},vrfid=>$_->{vrf}{id},network=>$network,bits=>$bits};
+    if($ret){
+      print "ret:".$ret->{bits}." bits:$bits \n";
+      if($ret->{bits}<$bits){
+        $ret=$obj;
+      }
+    }else{
+      $ret=$obj;
+    }
+  }
+  return $ret;
+}
+
 sub getPrefix{
   my ($self,$int,$ip) = @_;
   my $ninet = new NetAddr::IP $ip->{ip}.'/'.$ip->{bits};
@@ -546,7 +611,7 @@ sub updateIP{
   my $ipbits=$ip->{ip}.'/'.$ip->{bits};
   $self->info("updating:".$int.' '.$ipbits);
   my $pfinfo=$self->getPrefix($int,$ip);
-  my @except=('nat','arp','remote');
+  my @except=('nat','arp','remote','mgmt');
   if($i->{vrfid}){
     my $payload->{address}=$ipbits;;
     $payload->{vrf}=$i->{vrfid};
@@ -576,6 +641,10 @@ sub updateIP{
       $ipret->{hostname}=$self->{device}{hostname};
       $ipret->{int}=$int;
       $ipret->{ip}=$ipbits;
+    }
+    if($ip->{ip} eq $self->{device}{mgmtip}){
+      $self->{primary_ip}=$ip->{ip};
+      $self->goNetbox('dcim/devices/',$self->{device}{id},{primary_ip4=>$ipret->{id}});
     }
     return $ipret;
   }else{

@@ -45,19 +45,22 @@ sub new {
   );
 
   $nb->updateDevice();
-  if(!$nb->{error}{critical}){
+  if(!$nb->{error}{critical} && $nb->{device}{interfaces}){
     $nb->updateInterfaces();
     $nb->updateNats() if $args->{device}{nats};
     $nb->updateConnections();
     $nb->updateARP();
   }
-
+  $nb->updatePrimaryIP() if !$nb->{primary_ip};
+  
   if ($nb->{error}{critical}){
     print "CRITICAL ERRORS FOUND NO CACHE CREATED!\n";
+    print Dumper $nb->{error};
   }else{
     open(FILE,">$cachefile") or die $!;
     print FILE encode_json $args->{device};
     close FILE;
+    print Dumper $nb->{error}{warning};
     #print "json file updated!\n";
   }
   print('> Full Device updated in '.sprintf("%.2fs\n", tv_interval ($t0)));
