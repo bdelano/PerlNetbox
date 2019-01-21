@@ -77,9 +77,9 @@ sub getID{
   }else{
     if($res->{results}){
       my $rc=@{$res->{results}};
-      if($rc>=1){
+      if($rc==1){
         return $res->{results}[0]{id};
-      }elsif($rc<1){
+      }else{
         return 0;
       }
     }else{
@@ -144,8 +144,8 @@ sub updateDevice{
     push(@{$self->{error}{critical}},'ERROR:no serialnum found for '.$self->{device}{hostname});
     return;
   }
-  my $devid=$self->getID('dcim/devices/?serial='.$self->{device}{serial});
-  $devid=$self->getID('dcim/devices/?q='.$self->{device}{hostname}) if !$devid;
+  #my $devid=$self->getID('dcim/devices/?serial='.$self->{device}{serial});
+  my $devid=$self->getID('dcim/devices/?q='.$self->{device}{hostname});
   my $payload;
   if(!$devid){
     my $geninfo=$self->goNetbox('dcim/sites/?q='.$self->{device}{sitename})->{results}[0];
@@ -206,7 +206,7 @@ sub updatePrimaryIP{
         $self->goNetbox('dcim/devices/',$self->{device}{id},{primary_ip4=>$ipret->{id}});
       }
     }else{
-      push(@{$self->{error}{warning}},'ERROR: unable to set mgmt ip '.$self->{device}{hostname});
+      push(@{$self->{error}{warning}},'ERROR: unable to set primary ip '.$self->{device}{hostname});
     }
   }
 }
