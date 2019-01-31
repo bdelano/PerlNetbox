@@ -144,8 +144,9 @@ sub updateDevice{
     push(@{$self->{error}{critical}},'ERROR:no serialnum found for '.$self->{device}{hostname});
     return;
   }
-  #my $devid=$self->getID('dcim/devices/?serial='.$self->{device}{serial});
-  my $devid=$self->getID('dcim/devices/?q='.$self->{device}{hostname});
+  my $devid;
+  $devid=$self->getID('dcim/devices/?serial='.$self->{device}{serial}) if $self->{device}{vendor} ne 'opengear';
+  $devid=$self->getID('dcim/devices/?q='.$self->{device}{hostname}) if !$devid;
   my $payload;
   if(!$devid){
     my $geninfo=$self->goNetbox('dcim/sites/?q='.$self->{device}{sitename})->{results}[0];
@@ -194,12 +195,12 @@ sub updatePrimaryIP{
     $self->goNetbox('dcim/devices/',$self->{device}{id},$payload);
   }else{
     my $pfret=$self->getHighestPrefix($self->{device}{mgmtip});
+    print Dumper $pfret;
     if(@{$ipret}<1){
       if($pfret){
         my $intid=$self->addmgmtinterface();
         my $payload->{address}=$self->{device}{mgmtip}.'/'.$pfret->{bits};
-        $payload->{vrf}=$pfret->{vrf};
-        $payload->{prefix}=$pfret->{id};
+        $payload->{vrf}=$pfret->{vrfid};
         $payload->{tenant}=$self->{tenantid};
         $payload->{interface}=$intid;
         $ipret=$self->goNetbox('ipam/ip-addresses/','',$payload);
@@ -223,7 +224,7 @@ sub updateInterfaces{
   my $t0 = [gettimeofday];
   my $devints=$self->{device}{interfaces};
   my $nbxints=$self->{dcache}{interfaces};
-  $self->getcurrentInterfaces() if !$nbxints;
+  $nbxints=$self->getcurrentInterfaces() if !$nbxints;
   my @intupdate;
   my @retints;
   my @lags;
@@ -240,7 +241,7 @@ sub updateInterfaces{
   }
   for my $int (keys %{$nbxints}){
     if(!$devints->{$int}){
-      print "marking $int for deletion!\n";
+      $self->info("marking $int for deletion!");
       $self->{device}{interfaces}{$int}{delete}='1';
       push (@intupdate,$int);
     }
@@ -276,6 +277,7 @@ sub updateInterfaces{
 
 sub getcurrentInterfaces{
   my $self = shift;
+  my $intobj;
   my $intret;
   if($self->{device}{vendor} eq 'opengear'){
     $intret=$self->goNetbox('dcim/console-server-ports/?limit=1000&device_id='.$self->{device}{id})->{results};
@@ -283,8 +285,9 @@ sub getcurrentInterfaces{
     $intret=$self->goNetbox('dcim/interfaces/?limit=1000&device_id='.$self->{device}{id})->{results};
   }
   for(@{$intret}){
-    $self->{currentints}{$_->{name}}=$_->{id};
+    $intobj->{$_->{name}}={id=>$_->{id}};
   }
+  return $intobj;
 }
 
 sub getnbvlans{
@@ -393,6 +396,7 @@ sub updateInt{
   if($i->{delete}){
     $intret=$self->goNetbox('dcim/interfaces/',$intid,'delete');
     delete $self->{device}{interfaces}{$int};
+    return
   }else{
     if(!$i->{formfactor}){
       push(@{$self->{error}{critical}},'ERROR: no matching ff was found:'.$self->{device}{hostname}.' '.$int);
@@ -434,9 +438,8 @@ sub getHighestPrefix{
   my $ret;
   for(@{$pfret->{results}}){
     my ($network,$bits)=split('/',$_->{prefix});
-    my $obj={pfid=>$_->{id},vrfid=>$_->{vrf}{id},network=>$network,bits=>$bits};
+    my $obj={id=>$_->{id},vrfid=>$_->{vrf}{id},network=>$network,bits=>$bits};
     if($ret){
-      print "ret:".$ret->{bits}." bits:$bits \n";
       if($ret->{bits}<$bits){
         $ret=$obj;
       }
@@ -684,7 +687,7 @@ sub _sub{
     'ap-northeast'=>'ap-ne',
     'ap-southeast'=>'ap-se',
     'eu-central'=>'eu-c',
-    'eu-c-'=>'eu-central',
+    'eu-c-'=>'eu-central-',
     'ap-ne'=>'ap-northeast',
     'ap-se'=>'ap-southeast'
   };
@@ -769,6 +772,7 @@ sub connectMACs{
   my $ints=$self->{device}{interfaces};
   for(@{$ints->{$int}{macs}}){
     my $mac=$_;
+    $self->info("int:$int mac:$mac\n");
     my $nbmacinfo=$self->goNetbox('dcim/interfaces/?mac_address='.$mac)->{results}[0];
     my $nbmacid=$nbmacinfo->{id};
     if($nbmacid){
@@ -777,8 +781,10 @@ sub connectMACs{
       my $altrh=_sub($rh);
       my $altkey=$int.':'.$altrh.':'.$ri;
       $self->_removeint($int);
+      $self->_removeint($ints->{$int}{children}[0]) if $ints->{$int}{children}[0];
       if(!$connhash->{$key} && !$connhash->{$altkey}){
         my $nbintid=$ints->{$int}{id};
+        $nbintid=$self->getID('dcim/interfaces/?name='.$ints->{$int}{children}[0].'&device_id='.$self->{device}{id}) if $ints->{$int}{children}[0];
         $nbintid=$self->getID('dcim/interfaces/?name='.$int.'&device_id='.$self->{device}{id}) if !$nbintid;
         if($nbintid){
           $ints->{$int}{id}=$nbintid;

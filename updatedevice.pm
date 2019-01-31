@@ -34,7 +34,6 @@ sub new {
     $dcache=decode_json $dcachejson;
   }
   my $creds=auth->new($args->{client});
-
   my $nb=PerlNetbox::netbox->new(
   token=>$creds->{token},
   host=>$creds->{host},
@@ -52,7 +51,7 @@ sub new {
     $nb->updateARP();
   }
   $nb->updatePrimaryIP() if !$nb->{primary_ip};
-  
+
   if ($nb->{error}{critical}){
     print "CRITICAL ERRORS FOUND NO CACHE CREATED!\n";
     print Dumper $nb->{error};
