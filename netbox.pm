@@ -13,7 +13,6 @@ sub new{
   $self->{ffdict}=buildffdict();
   $self->{error}{critical}=();
   $self->{error}{warning}=();
-
   if ($self->{host} && $self->{token}){
     return bless $self,$class;
   }else{
@@ -91,12 +90,25 @@ sub getID{
 
 sub getDeviceType{
   my $self = shift;
-  my $dtid=$self->getID('dcim/device-types/?model='.$self->{device}{model});
-  if($dtid){
-    return $dtid;
+  my $id=$self->getID('dcim/device-types/?model='.$self->{device}{model});
+  if($id){
+    return $id;
   }else{
-    return '';
-    push(@{$self->{error}{warning}},'ERROR:unable to find model name'.$self->{device}{model});
+    my $vendid=$self->getID('dcim/manufacturers/?name='.$self->{device}{vendor});
+    my $payload->{model}=$self->{device}{model};
+    $payload->{slug}=_slugify($self->{device}{model});
+    $payload->{manufacturer}=$vendid;
+    $payload->{is_pdu}='true' if $self->{device}{devicerole} eq 'PDU';
+    $payload->{is_console_server}='true' if $self->{device}{devicerole} eq 'NW Console';
+    $payload->{is_network_device}='true' if $self->{device}{devicerole} ne 'NW Console';
+    $payload->{u_height}=1;
+    $payload->{is_full_depth}='true';
+    my $dtret=$self->goNetbox('dcim/device-types/','',$payload);
+    if($dtret->{id}){
+      return $dtret->{id};
+    }else{
+      push(@{$self->{error}{critical}},'ERROR:unable to find model name'.$self->{device}{model});
+    }
   }
 }
 
@@ -105,25 +117,32 @@ sub getPlatform{
   my $vendor=$self->{device}{vendor};
   print "vendor:$vendor\n";
   my $platobj={
-    "arista"=>"arista-eos",
-    "cisco"=>"cisco-ios",
-    "force10"=>"dell-ftos",
-    "juniper"=>"juniper-junos",
+    "arista"=>"Arista EOS",
+    "cisco"=>"Cisco IOS",
+    "force10"=>"Dell FTOS",
+    "juniper"=>"Juniper JUNOS",
     "opengear"=>"opengear",
+    "arbor"=>"ArbOS",
     "APC"=>"apc",
     "Sentry"=>"sentry"
   };
   if($platobj->{$vendor}){
-    my $id=$self->getID('dcim/platforms/?slug='.$platobj->{$vendor});
+    my $id=$self->getID('dcim/platforms/?name='.$platobj->{$vendor});
     if($id){
       return $id;
     }else{
-      push(@{$self->{error}{warning}},'ERROR:unable to find platform type:'.$vendor);
+      my $payload->{name}=$platobj->{$vendor};
+      $payload->{slug}=lc($platobj->{$vendor});
+      my $platret=$self->goNetbox('dcim/platforms/','',$payload);
+      if($platret->{id}){
+        return $platret->{id};
+      }else{
+        push(@{$self->{error}{critical}},'ERROR:unable to create platform type:'.$vendor.':'.$platobj->{$vendor});
+      }
     }
   }else{
-    push(@{$self->{error}{warning}},'error: unable to match vendor with platform:'.$vendor);
+    push(@{$self->{error}{critical}},'error: unable to match vendor with platform:'.$vendor);
   }
-
 }
 
 sub getDeviceRole{
@@ -132,7 +151,14 @@ sub getDeviceRole{
   if($id){
     return $id;
   }else{
-    push(@{$self->{error}{warning}},'ERROR:unable to find device role:'.$self->{device}{devicerole});
+    my $payload->{name}=$self->{device}{devicerole};
+    $payload->{slug}=_slugify($self->{device}{devicerole});
+    my $drret=$self->goNetbox('dcim/device-roles/','',$payload);
+    if($drret->{id}){
+      return $drret->{id};
+    }else{
+        push(@{$self->{error}{critical}},'ERROR:unable to find device role:'.$self->{device}{devicerole});
+    }
   }
 }
 
@@ -160,11 +186,17 @@ sub updateDevice{
       $payload->{tenant}=$geninfo->{tenant}{id};
       $payload->{serial}=$self->{device}{serial};
       $payload->{platform}=$self->getPlatform();
+      $payload->{comments}=$self->{device}{processor} if $self->{device}{processor};
       $payload->{site}=$geninfo->{id};
     }
   }else{
+    my $geninfo=$self->goNetbox('dcim/sites/?q='.$self->{device}{sitename})->{results}[0];
     $payload->{name}=$self->{device}{hostname};
     $payload->{serial}=$self->{device}{serial};
+    $payload->{comments}=$self->{device}{processor} if $self->{device}{processor};
+    $payload->{platform}=$self->getPlatform();
+    $payload->{device_role}=$self->getDeviceRole();
+    $payload->{site}=$geninfo->{id};
   }
   $self->info('=> updating device...');
   my $devret=$self->goNetbox('dcim/devices/',$devid,$payload);
@@ -176,10 +208,83 @@ sub updateDevice{
     $self->{siteslug}=$devret->{site}{slug};
     $self->{tenantid}=$devret->{tenant}{id};
     $self->{primary_ip}=$devret->{primary_ip4};
+    $self->rackDevice() if !$devret->{rack};
+    $self->updateInventory('dimms') if $self->{device}{dimms};
+    $self->updateInventory('slots') if $self->{device}{slots};
   }else{
     push(@{$self->{error}{critical}},'ERROR: unable to update device:'.$self->{device}{hostname});
   }
   print('=> Device updated in '.sprintf("%.2fs\n", tv_interval ($t0)));
+}
+
+sub rackDevice{
+  my $self = shift;
+  if($self->{device}{unum}){
+    my $groupid=$self->getID('dcim/rack-groups/?name='.$self->{device}{room}.'&site_id='.$self->{siteid});
+    if($groupid){
+      $self->{rackgroupid}=$groupid;
+      my $rackid=$self->getID('dcim/racks/?site_id='.$self->{siteid}.'&group_id='.$groupid.'&q='.$self->{device}{rack});
+      if($rackid){
+        $self->{rackid}=$rackid;
+      }else{
+        $self->info('adding rack!');
+        $self->addRack()
+      }
+      if($self->{rackid}){
+        my $payload->{rack}=$self->{rackid};
+        $payload->{position}=$self->{device}{unum};
+        $payload->{face}=0;
+        $self->goNetbox('dcim/devices/',$self->{device}{id},$payload);
+      }else{
+        push(@{$self->{error}{warning}},'ERROR: unable to add rack :'.$self->{device}{room}.':'.$self->{device}{rack}.':unum:'.$self->{device}{unum});
+      }
+    }else{
+      push(@{$self->{error}{warning}},'ERROR: unable to find rack group:'.$self->{device}{room});
+    }
+  }else{
+    push(@{$self->{error}{warning}},'ERROR: no unum found!');
+  }
+}
+
+sub addRack{
+  my $self = shift;
+  my $payload->{name}=$self->{device}{rack};
+  $payload->{facility_id}=$self->{device}{rack}.':'.$self->{device}{room}.':'.$self->{device}{sitename};
+  $payload->{site}=$self->{siteid};
+  $payload->{tenant}=$self->{tenantid};
+  $payload->{group}=$self->{rackgroupid};
+  my $rackret=$self->goNetbox('dcim/racks/','',$payload);
+  if($rackret->{id}){
+    $self->{rackid}=$rackret->{id}
+  }
+}
+
+sub updateInventory{
+  my ($self,$key)=@_;
+  my $inv=$self->{device}{$key};
+  my $nbinv=$self->{dcache}{$key};
+  for(keys %{$inv}){
+    my $i=$_;
+    if(!$nbinv->{$i}){
+      my $id=$self->getID('dcim/inventory-items/?name='.$inv->{$i}{name}.'&device_id='.$self->{device}{id});
+      if($id){
+        $inv->{$i}{id}=$id;
+      }else{
+        $inv->{$i}{device}=$self->{device}{id};
+        my $iret=$self->goNetbox('dcim/inventory-items/','',$inv->{$i});
+        if($iret->{id}){
+          $inv->{$i}{id}=$iret->{id};
+        }else{
+          push(@{$self->{error}{critical}},'ERROR: unable to add inventory item:'.$inv->{$i}{name});
+        }
+      }
+    }
+  }
+  for(keys %{$nbinv}){
+    if(!$inv->{$_}){
+      my $iret=$self->goNetbox('dcim/inventory-items/',$nbinv->{id},'delete');
+    }
+  }
 }
 
 sub updatePrimaryIP{
@@ -409,6 +514,7 @@ sub updateInt{
     $payload->{enable}='true';
     $payload->{form_factor}=$self->{ffdict}{uc($i->{formfactor})};
     $payload->{mtu}=$i->{mtu} if $i->{mtu};
+    $payload->{mac_address}=$i->{localmac} if $i->{localmac};
     #$payload->{tagged_vlans}=$i->{vlans} if $i->{vlans};
     my $descr=$i->{description};
     $descr=~s/.*(.{99})$/$1/i if $descr;#cut down to last 99 characters so it will fit
@@ -681,6 +787,13 @@ sub _removeint{
   }
 }
 
+sub _slugify{
+  my $s=shift;
+  $s=lc($s);
+  $s=~s/\s+/-/g;
+  return $s;
+}
+
 sub _sub{
   my $n =  shift;
   my $altsub={
@@ -930,6 +1043,7 @@ sub buildffdict{
   $ffdict{'QSFP28100GBASE-LR4'}=1600;
   $ffdict{'QSFP28100GBASE-LR4-LITE'}=1600;
   $ffdict{'QSFP28100GBASE-SR4'}=1600;
+  $ffdict{'QSFP28-IR4-100G'}=1600;
   $ffdict{'QSFP-100G-SR4'}=1600;
   $ffdict{'QSFP-100G-CWDM4'}=1600;
   $ffdict{'QSFP-100G-LR4'}=1600;
@@ -967,6 +1081,7 @@ sub buildffdict{
   $ffdict{'PHYSICAL'}=32767;
   $ffdict{'NONE'}=32767;
   $ffdict{'UNKNOWN'}=32767;
+  $ffdict{'UNSUPPORTED'}=32767;
   $ffdict{'CFPX-200G-DWDM'}=32767;
   return \%ffdict;
 }

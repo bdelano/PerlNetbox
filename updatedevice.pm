@@ -39,7 +39,6 @@ sub new {
   host=>$creds->{host},
   device=>$args->{device},
   dcache=>$dcache,
-  altinfo=>$args->{altinfo},
   debug=>$args->{debug}
   );
 
@@ -50,6 +49,7 @@ sub new {
     $nb->updateConnections();
     $nb->updateARP();
   }
+
   $nb->updatePrimaryIP() if !$nb->{primary_ip};
 
   if ($nb->{error}{critical}){
