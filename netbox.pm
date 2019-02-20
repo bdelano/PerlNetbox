@@ -94,7 +94,7 @@ sub getDeviceType{
   if($id){
     return $id;
   }else{
-    my $vendid=$self->getID('dcim/manufacturers/?name='.$self->{device}{vendor});
+    my $vendid=$self->getID('dcim/manufacturers/?slug='.$self->{device}{vendor});
     my $payload->{model}=$self->{device}{model};
     $payload->{slug}=_slugify($self->{device}{model});
     $payload->{manufacturer}=$vendid;
@@ -175,6 +175,7 @@ sub updateDevice{
   $devid=$self->getID('dcim/devices/?q='.$self->{device}{hostname}) if !$devid;
   my $payload;
   if(!$devid){
+    $self->{isnew}='yes';
     my $geninfo=$self->goNetbox('dcim/sites/?q='.$self->{device}{sitename})->{results}[0];
     if(!$geninfo){
       push(@{$self->{error}{critical}},'ERROR: unable to information for site:'.$self->{device}{sitename});
@@ -203,6 +204,7 @@ sub updateDevice{
   if($devret->{id}){
     #print Dumper $devret;
     $self->info('found id!');
+    $self->{device}{modelid}=$devret->{device_type}{id};
     $self->{device}{id}=$devret->{id};
     $self->{siteid}=$devret->{site}{id};
     $self->{siteslug}=$devret->{site}{slug};
@@ -217,24 +219,52 @@ sub updateDevice{
   print('=> Device updated in '.sprintf("%.2fs\n", tv_interval ($t0)));
 }
 
+sub findRack{
+  my $self = shift;
+  my $rack=$self->{device}{rack};
+  my $rret=$self->goNetbox('dcim/racks/?site_id='.$self->{siteid}.'&group_id='.$self->{rackgroupid}.'&q='.$rack);
+  if($rret->{count}>0){
+    for(@{$rret->{results}}){
+      if(
+      $_->{name} eq $rack ||
+      $_->{name} eq uc($rack) ||
+      $_->{name} eq lc($rack) ||
+      $_->{name}=~/[0]+$rack/i
+      ){
+        return $_->{id};
+      }
+    }
+  }
+}
+
 sub rackDevice{
   my $self = shift;
-  if($self->{device}{unum}){
+  if($self->{device}{unum} || $self->{device}{devicerole} eq 'PDU'){
     my $groupid=$self->getID('dcim/rack-groups/?name='.$self->{device}{room}.'&site_id='.$self->{siteid});
     if($groupid){
       $self->{rackgroupid}=$groupid;
-      my $rackid=$self->getID('dcim/racks/?site_id='.$self->{siteid}.'&group_id='.$groupid.'&q='.$self->{device}{rack});
+      my $rackid=$self->findRack();
       if($rackid){
         $self->{rackid}=$rackid;
       }else{
         $self->info('adding rack!');
-        $self->addRack()
+        $self->addRack();
       }
       if($self->{rackid}){
+        my $unum=$self->{device}{unum};
+        my $position=$unum;
+        if($unum){
+          my $modelret=$self->goNetbox('dcim/device-types/'.$self->{device}{modelid}.'/');
+          my $u_height=$modelret->{u_height};
+          $position=($unum-$u_height)+1;
+        }
         my $payload->{rack}=$self->{rackid};
-        $payload->{position}=$self->{device}{unum};
+        $payload->{position}=$position;
         $payload->{face}=0;
-        $self->goNetbox('dcim/devices/',$self->{device}{id},$payload);
+        my $rdret=$self->goNetbox('dcim/devices/',$self->{device}{id},$payload);
+        if(!$rdret->{id}){
+          push(@{$self->{error}{warning}},'ERROR: unable to rack device:'.$self->{device}{room}.':'.$self->{device}{rack}.':unum:'.$self->{device}{unum});
+        }
       }else{
         push(@{$self->{error}{warning}},'ERROR: unable to add rack :'.$self->{device}{room}.':'.$self->{device}{rack}.':unum:'.$self->{device}{unum});
       }
@@ -248,11 +278,20 @@ sub rackDevice{
 
 sub addRack{
   my $self = shift;
+  my $rackname=$self->{device}{rack};
+  my $uh;
+  if($self->{device}{sitename}=~/us-east-1[abc]/){
+    $uh=62;
+  }else{
+    $uh=45;
+  }
+  $rackname=~s/^([1-9][\d]{2,4})$/0$1/i;
   my $payload->{name}=$self->{device}{rack};
   $payload->{facility_id}=$self->{device}{rack}.':'.$self->{device}{room}.':'.$self->{device}{sitename};
   $payload->{site}=$self->{siteid};
   $payload->{tenant}=$self->{tenantid};
   $payload->{group}=$self->{rackgroupid};
+  $payload->{u_height}=$uh;
   my $rackret=$self->goNetbox('dcim/racks/','',$payload);
   if($rackret->{id}){
     $self->{rackid}=$rackret->{id}
@@ -300,7 +339,6 @@ sub updatePrimaryIP{
     $self->goNetbox('dcim/devices/',$self->{device}{id},$payload);
   }else{
     my $pfret=$self->getHighestPrefix($self->{device}{mgmtip});
-    print Dumper $pfret;
     if(@{$ipret}<1){
       if($pfret){
         my $intid=$self->addmgmtinterface();
@@ -339,7 +377,7 @@ sub updateInterfaces{
     $devdescr=$devints->{$int}{description} if $devints->{$int}{description};
     $nbxdescr=$nbxints->{$int}{description} if $nbxints->{$int}{description};
     if($devdescr ne $nbxdescr || !$nbxints->{$int}{formfactor}){
-      delete $self->{currentints}{$int};
+      #delete $self->{currentints}{$int};
       #print "adding:".$int.':'.$devints->{$int}{formfactor}."\n";
       push(@intupdate,$int)
     }
@@ -431,7 +469,6 @@ sub addvlan{
     $payload->{name}="not found";
     $payload->{tenant}=$self->{tenantid};
     my $vlret=$self->goNetbox('ipam/vlans/','',$payload);
-    print Dumper $vlret;
     my $vlid=$vlret->{id};
     $self->{nbvlanhash}{$vl}=$vlid;
   }
@@ -453,38 +490,17 @@ sub updateLAG{
 sub updateConsole{
   my ($self,$int,$server)=@_;
   my $i=$self->{device}{interfaces}{$int};
-  my $portname=$int.':'.$i->{label};
-  my $intid=$self->getID('dcim/console'.$server.'-ports/?device_id='.$self->{device}{id}.'&name='.$portname);
+  my $intid=$self->getID('dcim/console'.$server.'-ports/?device_id='.$self->{device}{id}.'&name='.$int);
+  my $intret;
   if(!$intid && $i->{delete}){
     delete $self->{device}{interfaces}{$int};
-    return;
-  }
-  my $intret;
-  if($i->{delete}){
+  }elsif($i->{delete}){
     $intret=$self->goNetbox('dcim/console'.$server.'-ports/',$intid,'delete');
     delete $self->{device}{interfaces}{$int};
   }else{
     my $payload->{device}=$self->{device}{id};
-    $payload->{name}=$portname;
-    $intret=$self->goNetbox('dcim/console'.$server.'-ports/',$intid,$payload);
-    if($intret->{id}){
-      if($int ne 'console'){
-        my $rmdevret=$self->goNetbox('dcim/devices/?q='.$i->{label})->{results};
-        if(@{$rmdevret}==1){
-          my $cpid=$self->getID('dcim/console-ports/?name=console&device_id='.$rmdevret->[0]{id});
-          my $payload->{cs_port}=$intret->{id};
-          $self->goNetbox('dcim/console-ports/',$cpid,$payload);
-        }elsif(@{$rmdevret}>1){
-          push(@{$self->{error}{warning}},'console:too many device matches'.@{$rmdevret}.' '.$i->{label});
-        }else{
-          push(@{$self->{error}{warning}},'console:no devices found for '.$i->{label});
-        }
-      }
-    }else{
-      push(@{$self->{error}{critical}},'ERROR: pushing console update:'.$self->{device}{hostname}.' '.$int);
-    }
-
-
+    $payload->{name}=$int;
+    $intid=$self->goNetbox('dcim/console'.$server.'-ports/',$intid,$payload)->{id} if !$intid;
   }
 }
 
@@ -599,12 +615,13 @@ sub getPrefix{
 sub getVRFid{
   my ($self,$int)=@_;
   my $vrf=$self->{device}{interfaces}{$int}{vrf};
+  my $intid=$self->{device}{interfaces}{$int}{id};
   my ($vrfname,$payload);
   if(!$vrf){
     $vrfname='global';
   }else{
     $vrfname=$self->{siteslug}.' '.$vrf;
-    my $rd=$vrf.':'.$self->{siteslug};
+    my $rd=$intid.':'.$self->{siteid};
     $payload->{name}=$vrfname;
     $payload->{rd}=$rd;
     $payload->{tenant}=$self->{tenantid};
@@ -613,6 +630,9 @@ sub getVRFid{
   my $ret=$self->goNetbox('ipam/vrfs/?q='.$vrfname);
   if($ret->{count}<1){
     $ret=$self->goNetbox('ipam/vrfs/','',$payload);
+    if(!$ret->{id}){
+      push(@{$self->{error}{critical}},'Unable to add VRF:'.$int.':'.$vrfname) if !$ret->{id};
+    }
     return $ret->{id};
   }else{
     return $ret->{results}[0]{id};
@@ -761,6 +781,17 @@ sub updateIP{
   }
 }
 
+sub buildOOBconnhash{
+  my $self=shift;
+  my $cl=$self->goNetbox('dcim/console-connections/?device='.$self->{device}{hostname});
+  if($cl->{'count'}>0){
+    for(@{$cl->{results}}){
+      $self->{connhash}{$_->{device}{name}}=$_->{cable}{id};
+    }
+  }
+  $self->info('conhash built');
+}
+
 sub buildconnhash{
   my $self=shift;
   my $cl=$self->goNetbox('dcim/interface-connections/?device='.$self->{device}{hostname});
@@ -773,11 +804,12 @@ sub buildconnhash{
         $bdev=$res->{interface_b}{device}{name};
         $bint=$res->{interface_b}{name};
         my $altbdev=_sub($bdev);
-        $self->{connhash}{$aint.':'.$bdev.':'.$bint}=$_->{id};
-        $self->{connhash}{$aint.':'.$altbdev.':'.$bint}=$_->{id};
+        $self->{connhash}{$aint.':'.$bdev.':'.$bint}=$_->{interface_b}{cable};
+        $self->{connhash}{$aint.':'.$altbdev.':'.$bint}=$_->{interface_b}{cable};
       }
     }
   }
+  $self->info('conhash built');
 }
 
 sub _removeint{
@@ -817,10 +849,17 @@ sub _sub{
 
 sub updateConnections{
   my $self = shift;
+  print "=> Updating connections...\n";
   my $t0 = [gettimeofday];
-  $self->buildconnhash();
+  if($self->{device}{vendor} eq 'opengear'){
+    $self->buildOOBconnhash();
+  }else{
+    $self->buildconnhash();
+  }
   my $ints=$self->{device}{interfaces};
   for(keys %{$ints}){
+    #todo need to update the connections to specify different cable types
+    $self->connectConsole($_) if $self->{device}{vendor} eq 'opengear';
     $self->connectMACs($_) if $ints->{$_}{macs};
     $self->connectLLDP($_) if $ints->{$_}{lldp};
   }
@@ -830,14 +869,47 @@ sub updateConnections{
   }
   my $delhold;
   my $ch=$self->{connhash};
+
   for(keys %{$ch}){
     if(!$delhold->{$ch->{$_}}){
       $delhold->{$ch->{$_}}='deleted';
-      #print "deleting:".$_."\n";
-      my $del=$self->goNetbox('dcim/interface-connections/',$ch->{$_},'delete');
+      $self->info("deleting:".$_);
+      my $del=$self->goNetbox('dcim/cables/',$ch->{$_},'delete');
     }
   }
   print('=> Connections updated in '.sprintf("%.2fs\n", tv_interval ($t0)));
+}
+
+sub connectConsole{
+  my ($self,$int) = @_;
+  my $t0 = [gettimeofday];
+  my $connhash=$self->{connhash};
+  my $i=$self->{device}{interfaces}{$int};
+  $self->{connhold}{$i->{label}}='hold';
+  if(!$self->{connhash}{$i->{label}} && $i->{label} !~/^(Port|Front\sUSB)\s.*/i){
+    my $intid=$self->goNetbox('dcim/console-server-ports/?device_id='.$self->{device}{id}.'&name='.$int)->{results}[0]{id};
+    if($intid){
+      my $rmdevret=$self->goNetbox('dcim/devices/?q='.$i->{label})->{results};
+      if(@{$rmdevret}==1){
+        my $cpid=$self->getID('dcim/console-ports/?device_id='.$rmdevret->[0]{id});
+        if($cpid){
+          my $payload->{termination_a_id}=$cpid;
+          $payload->{termination_a_type}='dcim.consoleport';
+          $payload->{termination_b_id}=$intid;
+          $payload->{termination_b_type}='dcim.consoleserverport';
+          my $cableret=$self->goNetbox('dcim/cables/','',$payload);
+          push(@{$self->{error}{warning}},'console:unable to connect device'.$rmdevret->[0]{name}) if !$cableret->{id};
+        }
+      }elsif(@{$rmdevret}>1){
+        push(@{$self->{error}{warning}},'console:too many device matches'.@{$rmdevret}.' '.$i->{label});
+      }else{
+        push(@{$self->{error}{warning}},'console:no devices found for '.$i->{label});
+      }
+    }else{
+      push(@{$self->{error}{warning}},'console:unable to find local interface:'.$int);
+    }
+    print('==>'.$int.' Console connected in '.sprintf("%.2fs\n", tv_interval ($t0)));
+  }
 }
 
 sub connectLLDP{
@@ -848,13 +920,16 @@ sub connectLLDP{
   for(@{$ints->{$int}{lldp}}){
     my $rh=$_->{rh};
     my $ri=$_->{ri};
+    $self->info('lldp:'.$rh.':'.$ri);
     $ri=~s/Gi/GigabitEthernet/ if $ri=~/Gi[\d]/;
     $ri=~s/(.*)/$1.0/ if $ri=~/et-/ && $ri !~ /.*\.[\d]+$/;
     my $key=$int.':'.$rh.':'.$ri;
     my $altrh=_sub($rh);
     my $altkey=$int.':'.$altrh.':'.$ri;
     $self->_removeint($int);
-    if(!$connhash->{$key} && !$connhash->{$altkey} && $ri !~/([\w:]+){5}[\w]+/){
+
+    if(!$connhash->{$key} && !$connhash->{$altkey}){
+      $self->info('lldpkey:'.$key.' lldpaltkey:'.$altkey.' ri:'.$ri);
       my $nbrintid=$self->getID('dcim/interfaces/?device='.$rh.'&name='.$ri);
       if(!$nbrintid){
         my $rdevid=$self->getID('dcim/devices/?q='.$rh);
@@ -865,8 +940,11 @@ sub connectLLDP{
         $nblintid=$self->getID('dcim/interfaces/?name='.$int.'&device_id='.$self->{device}{id}) if !$nblintid;
         if($nblintid){
           $ints->{$int}{id}=$nblintid;
-          my $payload={"interface_a"=>$nblintid,"interface_b"=>$nbrintid};
-          my $conninfo=$self->goNetbox('dcim/interface-connections/','',$payload);
+          my $payload={"termination_a_id"=>$nblintid,"termination_b_id"=>$nbrintid};
+          $payload->{termination_a_type}="dcim.interface";
+          $payload->{termination_b_type}="dcim.interface";
+          $payload->{type}=1500;
+          my $conninfo=$self->goNetbox('dcim/cables/','',$payload);
         }else{
           push(@{$self->{error}{warning}},"lldp Connect ERROR: no match for $int");
         }
@@ -901,9 +979,11 @@ sub connectMACs{
         $nbintid=$self->getID('dcim/interfaces/?name='.$int.'&device_id='.$self->{device}{id}) if !$nbintid;
         if($nbintid){
           $ints->{$int}{id}=$nbintid;
-          my $payload={"interface_a"=>$nbintid,"interface_b"=>$nbmacid};
-          my $conninfo=$self->goNetbox('dcim/interface-connections/','',$payload);
-          #print Dumper $conninfo;
+          my $payload={"termination_a_id"=>$nbintid,"termination_b_id"=>$nbmacid};
+          $payload->{termination_a_type}="dcim.interface";
+          $payload->{termination_b_type}="dcim.interface";
+          $payload->{type}=1500;
+          my $conninfo=$self->goNetbox('dcim/cables/','',$payload);
         }else{
           push(@{$self->{error}{warning}},"mac Connect ERROR: no match for $int");
         }
