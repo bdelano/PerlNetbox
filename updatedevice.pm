@@ -50,7 +50,7 @@ sub new {
     $nb->updateARP();
   }
 
-  $nb->updatePrimaryIP() if !$nb->{primary_ip};
+  $nb->updatePrimaryIP() if !$nb->{primary_ip} && $nb->{device}{vendor} ne 'opengear';
 
   if ($nb->{error}{critical}){
     print "CRITICAL ERRORS FOUND NO CACHE CREATED!\n";
