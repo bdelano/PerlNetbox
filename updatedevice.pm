@@ -43,14 +43,15 @@ sub new {
   );
 
   $nb->updateDevice();
-  if(!$nb->{error}{critical} && $nb->{device}{interfaces}){
-    $nb->updateInterfaces();
-    $nb->updateNats() if $args->{device}{nats};
-    $nb->updateConnections();
-    $nb->updateARP();
+  if(!$nb->{error}{critical}){
+    if($nb->{device}{interfaces}){
+      $nb->updateInterfaces();
+      #$nb->updateNats() if $args->{device}{nats};
+      $nb->updateConnections() if $nb->{device}{connints}>0;
+      #$nb->updateARP() if $nb->{device}{arpints}>0;
+    }
+    $nb->updatePrimaryIP() if !$nb->{primary_ip} && $nb->{device}{mgmtip} && $nb->{device}{vendor} ne 'opengear';
   }
-
-  $nb->updatePrimaryIP() if !$nb->{primary_ip} && $nb->{device}{vendor} ne 'opengear';
 
   if ($nb->{error}{critical}){
     print "CRITICAL ERRORS FOUND NO CACHE CREATED!\n";

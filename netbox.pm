@@ -94,13 +94,10 @@ sub getDeviceType{
   if($id){
     return $id;
   }else{
-    my $vendid=$self->getID('dcim/manufacturers/?slug='.$self->{device}{vendor});
+    my $vendid=$self->getID('dcim/manufacturers/?slug='.lc($self->{device}{vendor}));
     my $payload->{model}=$self->{device}{model};
     $payload->{slug}=_slugify($self->{device}{model});
     $payload->{manufacturer}=$vendid;
-    $payload->{is_pdu}='true' if $self->{device}{devicerole} eq 'PDU';
-    $payload->{is_console_server}='true' if $self->{device}{devicerole} eq 'NW Console';
-    $payload->{is_network_device}='true' if $self->{device}{devicerole} ne 'NW Console';
     $payload->{u_height}=1;
     $payload->{is_full_depth}='true';
     my $dtret=$self->goNetbox('dcim/device-types/','',$payload);
@@ -177,8 +174,9 @@ sub updateDevice{
   if(!$devid){
     $self->{isnew}='yes';
     my $geninfo=$self->goNetbox('dcim/sites/?q='.$self->{device}{sitename})->{results}[0];
+    $geninfo=$self->goNetbox('dcim/sites/?q='._sub($self->{device}{sitename}))->{results}[0] if !$geninfo;
     if(!$geninfo){
-      push(@{$self->{error}{critical}},'ERROR: unable to information for site:'.$self->{device}{sitename});
+      push(@{$self->{error}{critical}},'ERROR: unable to find information for site:'.$self->{device}{sitename});
       return;
     }else{
       $payload->{name}=$self->{device}{hostname};
@@ -191,13 +189,14 @@ sub updateDevice{
       $payload->{site}=$geninfo->{id};
     }
   }else{
-    my $geninfo=$self->goNetbox('dcim/sites/?q='.$self->{device}{sitename})->{results}[0];
+    #my $geninfo=$self->goNetbox('dcim/sites/?q='.$self->{device}{sitename})->{results}[0];
+    #$geninfo=$self->goNetbox('dcim/sites/?q='._sub($self->{device}{sitename}))->{results}[0] if !$geninfo;
+    #$payload->{site}=$geninfo->{id};
     $payload->{name}=$self->{device}{hostname};
     $payload->{serial}=$self->{device}{serial};
     $payload->{comments}=$self->{device}{processor} if $self->{device}{processor};
-    $payload->{platform}=$self->getPlatform();
-    $payload->{device_role}=$self->getDeviceRole();
-    $payload->{site}=$geninfo->{id};
+    #$payload->{platform}=$self->getPlatform();
+    #$payload->{device_role}=$self->getDeviceRole();
   }
   $self->info('=> updating device...');
   my $devret=$self->goNetbox('dcim/devices/',$devid,$payload);
@@ -208,8 +207,16 @@ sub updateDevice{
     $self->{device}{id}=$devret->{id};
     $self->{siteid}=$devret->{site}{id};
     $self->{siteslug}=$devret->{site}{slug};
+    $self->{device}{sitename}=$devret->{site}{name};
     $self->{tenantid}=$devret->{tenant}{id};
     $self->{primary_ip}=$devret->{primary_ip4};
+    if($devret->{rack}){
+      my $rdn=$devret->{rack}{display_name};
+      if($rdn=~/.*\((.*)[-:]([\d]+)\)/){
+        $self->{device}{room}=$1;
+        $self->{device}{rack}=$2
+      }
+    }
     $self->rackDevice() if !$devret->{rack};
     $self->updateInventory('dimms') if $self->{device}{dimms};
     $self->updateInventory('slots') if $self->{device}{slots};
@@ -239,7 +246,7 @@ sub findRack{
 
 sub rackDevice{
   my $self = shift;
-  if($self->{device}{unum} || $self->{device}{devicerole} eq 'PDU'){
+  if(($self->{device}{unum} || $self->{device}{devicerole} eq 'PDU') && $self->{device}{room}){
     my $groupid=$self->getID('dcim/rack-groups/?name='.$self->{device}{room}.'&site_id='.$self->{siteid});
     if($groupid){
       $self->{rackgroupid}=$groupid;
@@ -365,6 +372,8 @@ sub updateInterfaces{
   my $self = shift;
   $self->info('=> updating interfaces...');
   my $t0 = [gettimeofday];
+  $self->{device}{arpints}=0;
+  $self->{device}{connints}=0;
   my $devints=$self->{device}{interfaces};
   my $nbxints=$self->{dcache}{interfaces};
   $nbxints=$self->getcurrentInterfaces() if !$nbxints;
@@ -373,6 +382,8 @@ sub updateInterfaces{
   my @lags;
   for my $int (keys %{$devints}){
     #$self->info('int:'.$int);
+    $self->{device}{arpints}=$self->{device}{arpints}+1 if $devints->{$int}{arp};
+    $self->{device}{connints}=$self->{device}{connints}+1 if $devints->{$int}{macs} or $devints->{$int}{lldp};
     my ($devdescr,$nbxdescr,$devip,$nbxip)=('','','','');
     $devdescr=$devints->{$int}{description} if $devints->{$int}{description};
     $nbxdescr=$nbxints->{$int}{description} if $nbxints->{$int}{description};
@@ -574,7 +585,9 @@ sub getHighestPrefix{
 
 sub getPrefix{
   my ($self,$int,$ip) = @_;
-  my $ninet = new NetAddr::IP $ip->{ip}.'/'.$ip->{bits};
+  my $bits=$ip->{bits};
+  $bits=31 if $bits=='32';
+  my $ninet = new NetAddr::IP $ip->{ip}.'/'.$bits;
   if($ninet->masklen()<32){
     my ($net,$bits)=split(/\//,$ninet->network);
     my $pfkey=$net.'/'.$bits.$self->{siteslug};
@@ -753,7 +766,7 @@ sub updateIP{
     my $ipid;
     my $ipret=$self->goNetbox('ipam/ip-addresses/?'.$ipq)->{results}[0];
     $ipid=$ipret->{id} if $ipret;
-    if($ip->{type} eq 'arp'  && !$ipid){
+    if($ip->{type} eq 'arp' && !$ipid){
       $payload->{description}='ARP for '.$self->{device}{hostname}.' '.$int;
       $ipret=$self->goNetbox('ipam/ip-addresses/',$ipid,$payload);
       push(@{$self->{device}{arpadded}},$ipret->{id});
@@ -794,22 +807,32 @@ sub buildOOBconnhash{
 
 sub buildconnhash{
   my $self=shift;
-  my $cl=$self->goNetbox('dcim/interface-connections/?device='.$self->{device}{hostname});
+  my $cl=$self->goNetbox('dcim/interface-connections/?device='.$self->{device}{hostname}.'&limit=1000');
   if($cl->{'count'}>0){
     for(@{$cl->{results}}){
       my $res=$_;
-      my ($bdev,$aint,$bint);
       if($res->{interface_a}{device}{name} eq $self->{device}{hostname}){
-        $aint=$res->{interface_a}{name};
-        $bdev=$res->{interface_b}{device}{name};
-        $bint=$res->{interface_b}{name};
-        my $altbdev=_sub($bdev);
-        $self->{connhash}{$aint.':'.$bdev.':'.$bint}=$_->{interface_b}{cable};
-        $self->{connhash}{$aint.':'.$altbdev.':'.$bint}=$_->{interface_b}{cable};
+        $self->_addconn($res,'a','b');
+      }elsif($res->{interface_b}{device}{name} eq $self->{device}{hostname}){
+        $self->_addconn($res,'b','a');
       }
     }
   }
   $self->info('conhash built');
+}
+
+sub _addconn{
+  my ($self,$res,$a,$b)=@_;
+  my ($bdev,$aint,$bint);
+  my $ia='interface_'.$a;
+  my $ib='interface_'.$b;
+  $aint=$res->{$ia}{name};
+  $bdev=$res->{$ib}{device}{name};
+  $bint=$res->{$ib}{name};
+  my $altbdev=_sub($bdev);
+  $altbdev=~s/-service/-ss/i;
+  $self->{connhash}{$aint.':'.$bdev.':'.$bint}=$_->{$ib}{cable};
+  $self->{connhash}{$aint.':'.$altbdev.':'.$bint}=$_->{$ib}{cable};
 }
 
 sub _removeint{
@@ -856,6 +879,7 @@ sub updateConnections{
   }else{
     $self->buildconnhash();
   }
+
   my $ints=$self->{device}{interfaces};
   for(keys %{$ints}){
     #todo need to update the connections to specify different cable types
@@ -925,6 +949,7 @@ sub connectLLDP{
     $ri=~s/(.*)/$1.0/ if $ri=~/et-/ && $ri !~ /.*\.[\d]+$/;
     my $key=$int.':'.$rh.':'.$ri;
     my $altrh=_sub($rh);
+    $altrh=~s/-service/-ss/i;
     my $altkey=$int.':'.$altrh.':'.$ri;
     $self->_removeint($int);
 
@@ -1001,7 +1026,6 @@ sub updateARP{
   $self->currentArp();
   my $ints=$self->{device}{interfaces};
   my $cints=$self->{dcache}{interfaces};
-
   for(keys %{$ints}){
     my $int=$_;
     if($ints->{$int}{arp}){
@@ -1018,9 +1042,11 @@ sub updateARP{
         if($_->{bits}){
           $_->{type}='arp';
           my $ipnet=$_->{ip}.'/'.$_->{bits};
-          my $m=$_->{ip};
-          delete $self->{currentarp}{$ipnet};
-          push(@addarp,$_) if !grep($m,$cints->{$int}{arp});
+          if($self->{currentarp}{$ipnet}){
+            delete $self->{currentarp}{$ipnet};
+          }else{
+            push(@addarp,$_);
+          }
         }
       }
 
@@ -1032,6 +1058,7 @@ sub updateARP{
 
       for(@addarp){
         my $ipnet=$_->{ip}.'/'.$_->{bits};
+        #print "ipnet:$ipnet \n";
         if(!$self->{currentarp}{$ipnet} && $_->{bits}){
           $self->updateIP($int,$self->{device}{interfaces}{$int},$_);
         }
