@@ -47,10 +47,11 @@ sub new {
     if($nb->{device}{interfaces}){
       $nb->updateInterfaces();
       #$nb->updateNats() if $args->{device}{nats};
-      $nb->updateConnections() if $nb->{device}{connints}>0;
+      #$nb->updateConnections() if $nb->{device}{connints}>0;
       #$nb->updateARP() if $nb->{device}{arpints}>0;
+      $nb->updatePrimaryIP() if !$nb->{primary_ip} && $nb->{device}{mgmtip} && $nb->{device}{vendor} ne 'opengear';
+      $nb->prefixFromStatic();
     }
-    $nb->updatePrimaryIP() if !$nb->{primary_ip} && $nb->{device}{mgmtip} && $nb->{device}{vendor} ne 'opengear';
   }
 
   if ($nb->{error}{critical}){

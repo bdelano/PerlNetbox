@@ -70,28 +70,35 @@ sub goNetbox{
 sub getID{
   my ($self,$p)=@_;
   my $res=$self->goNetbox($p);
+  $self->info($res);
+  my $ret=0;
   if($res->{error}){
     push(@{$self->{error}},$res->{error});
-    return;
   }else{
     if($res->{results}){
       my $rc=@{$res->{results}};
       if($rc==1){
-        return $res->{results}[0]{id};
-      }else{
-        return 0;
+        $ret=$res->{results}[0]{id};
       }
     }else{
       push(@{$self->{error}{warning}},"ERROR : getID : results for $p");
-      return;
     }
   }
+  return $ret;
 }
 
 sub getDeviceType{
   my $self = shift;
+  my $cp='none';
+  $cp=1 if $self->{device}{modules};
+  $cp=0 if $self->{device}{parent};
   my $id=$self->getID('dcim/device-types/?model='.$self->{device}{model});
   if($id){
+    if($cp ne 'none'){
+      my $payload->{subdevice_role}=$cp;
+      $payload->{u_height}=0 if $cp==0;
+      $self->goNetbox('dcim/device-types/',$id,$payload)
+    }
     return $id;
   }else{
     my $vendid=$self->getID('dcim/manufacturers/?slug='.lc($self->{device}{vendor}));
@@ -99,7 +106,9 @@ sub getDeviceType{
     $payload->{slug}=_slugify($self->{device}{model});
     $payload->{manufacturer}=$vendid;
     $payload->{u_height}=1;
+    $payload->{u_height}=0 if $cp==0;
     $payload->{is_full_depth}='true';
+    $payload->{subdevice_role}=$cp if $cp ne 'none';
     my $dtret=$self->goNetbox('dcim/device-types/','',$payload);
     if($dtret->{id}){
       return $dtret->{id};
@@ -117,11 +126,7 @@ sub getPlatform{
     "arista"=>"Arista EOS",
     "cisco"=>"Cisco IOS",
     "force10"=>"Dell FTOS",
-    "juniper"=>"Juniper JUNOS",
-    "opengear"=>"opengear",
-    "arbor"=>"ArbOS",
-    "APC"=>"apc",
-    "Sentry"=>"sentry"
+    "juniper"=>"Juniper JUNOS"
   };
   if($platobj->{$vendor}){
     my $id=$self->getID('dcim/platforms/?name='.$platobj->{$vendor});
@@ -134,11 +139,13 @@ sub getPlatform{
       if($platret->{id}){
         return $platret->{id};
       }else{
-        push(@{$self->{error}{critical}},'ERROR:unable to create platform type:'.$vendor.':'.$platobj->{$vendor});
+        push(@{$self->{error}{warning}},'ERROR:unable to create platform type:'.$vendor.':'.$platobj->{$vendor});
+        return '';
       }
     }
   }else{
-    push(@{$self->{error}{critical}},'error: unable to match vendor with platform:'.$vendor);
+    push(@{$self->{error}{warning}},'error: unable to match vendor with platform:'.$vendor);
+    return '';
   }
 }
 
@@ -168,9 +175,16 @@ sub updateDevice{
     return;
   }
   my $devid;
-  $devid=$self->getID('dcim/devices/?serial='.$self->{device}{serial}) if $self->{device}{vendor} ne 'opengear';
-  $devid=$self->getID('dcim/devices/?q='.$self->{device}{hostname}) if !$devid;
-  my $payload;
+  $devid=$self->getID('dcim/devices/?name='.$self->{device}{hostname});
+  $devid=$self->getID('dcim/devices/?serial='.$self->{device}{serial}) if $self->{device}{vendor} ne 'opengear' && !$devid;
+  $self->info('DEVICEID:'.$devid);
+
+  my $payload->{status}=1;
+  $payload->{comments}=$self->{device}{processor} if $self->{device}{processor};
+  $payload->{serial}=$self->{device}{serial};
+  $payload->{name}=$self->{device}{hostname};
+  $payload->{device_type}=$self->getDeviceType();
+
   if(!$devid){
     $self->{isnew}='yes';
     my $geninfo=$self->goNetbox('dcim/sites/?q='.$self->{device}{sitename})->{results}[0];
@@ -179,24 +193,12 @@ sub updateDevice{
       push(@{$self->{error}{critical}},'ERROR: unable to find information for site:'.$self->{device}{sitename});
       return;
     }else{
-      $payload->{name}=$self->{device}{hostname};
-      $payload->{device_type}=$self->getDeviceType();
-      $payload->{device_role}=$self->getDeviceRole();
-      $payload->{tenant}=$geninfo->{tenant}{id};
-      $payload->{serial}=$self->{device}{serial};
-      $payload->{platform}=$self->getPlatform();
-      $payload->{comments}=$self->{device}{processor} if $self->{device}{processor};
       $payload->{site}=$geninfo->{id};
+      $payload->{device_role}=$self->getDeviceRole();
     }
   }else{
-    #my $geninfo=$self->goNetbox('dcim/sites/?q='.$self->{device}{sitename})->{results}[0];
-    #$geninfo=$self->goNetbox('dcim/sites/?q='._sub($self->{device}{sitename}))->{results}[0] if !$geninfo;
-    #$payload->{site}=$geninfo->{id};
-    $payload->{name}=$self->{device}{hostname};
-    $payload->{serial}=$self->{device}{serial};
-    $payload->{comments}=$self->{device}{processor} if $self->{device}{processor};
-    #$payload->{platform}=$self->getPlatform();
-    #$payload->{device_role}=$self->getDeviceRole();
+    $payload->{tags}=['network'];
+    $payload->{face}=undef if $self->{device}{parent};
   }
   $self->info('=> updating device...');
   my $devret=$self->goNetbox('dcim/devices/',$devid,$payload);
@@ -208,22 +210,37 @@ sub updateDevice{
     $self->{siteid}=$devret->{site}{id};
     $self->{siteslug}=$devret->{site}{slug};
     $self->{device}{sitename}=$devret->{site}{name};
-    $self->{tenantid}=$devret->{tenant}{id};
     $self->{primary_ip}=$devret->{primary_ip4};
-    if($devret->{rack}){
-      my $rdn=$devret->{rack}{display_name};
-      if($rdn=~/.*\((.*)[-:]([\d]+)\)/){
-        $self->{device}{room}=$1;
-        $self->{device}{rack}=$2
-      }
-    }
-    $self->rackDevice() if !$devret->{rack};
+    #if($devret->{rack} && $self->{device}{devicerole} eq 'PDU'){
+    #  my $rackinfo=$self->goNetbox('dcim/racks/?id__in='.$devret->{rack}{id},'','');
+    #  $self->{device}{room}=$rackinfo->{results}[0]{group}{name};
+    #  $self->{device}{rack}=$rackinfo->{results}[0]{name}
+    #}
+
+    $self->addDeviceBay() if $self->{device}{parent};
+    #$self->rackDevice() if !$devret->{rack};
+    #print Dumper $self->{device}{gbics} if $self->{device}{gbics};
     $self->updateInventory('dimms') if $self->{device}{dimms};
     $self->updateInventory('slots') if $self->{device}{slots};
+    $self->updateInventory('gbics') if $self->{device}{gbics};
   }else{
     push(@{$self->{error}{critical}},'ERROR: unable to update device:'.$self->{device}{hostname});
   }
   print('=> Device updated in '.sprintf("%.2fs\n", tv_interval ($t0)));
+}
+
+sub addDeviceBay{
+  my $self = shift;
+  my $dbret=$self->goNetbox('dcim/device-bays/?device_id='.$self->{device}{parent}.'&name='.$self->{device}{cardname});
+  my $payload;
+  if($dbret->{count}>0){
+    $payload->{installed_device}=$self->{device}{id} if $dbret->{results}[0]{installed_device}{id} ne $self->{device}{id};
+  }else{
+    $payload->{name}=$self->{device}{cardname};
+    $payload->{device}=$self->{device}{parent};
+    $payload->{installed_device}=$self->{device}{id};
+  }
+  $self->goNetbox('dcim/device-bays/',$dbret->{results}[0]{id},$payload) if $payload;
 }
 
 sub findRack{
@@ -279,7 +296,7 @@ sub rackDevice{
       push(@{$self->{error}{warning}},'ERROR: unable to find rack group:'.$self->{device}{room});
     }
   }else{
-    push(@{$self->{error}{warning}},'ERROR: no unum found!');
+    push(@{$self->{error}{warning}},'ERROR: no unum found, room:'.$self->{device}{room}.' rack:'.$self->{device}{rack});
   }
 }
 
@@ -296,7 +313,6 @@ sub addRack{
   my $payload->{name}=$self->{device}{rack};
   $payload->{facility_id}=$self->{device}{rack}.':'.$self->{device}{room}.':'.$self->{device}{sitename};
   $payload->{site}=$self->{siteid};
-  $payload->{tenant}=$self->{tenantid};
   $payload->{group}=$self->{rackgroupid};
   $payload->{u_height}=$uh;
   my $rackret=$self->goNetbox('dcim/racks/','',$payload);
@@ -309,6 +325,7 @@ sub updateInventory{
   my ($self,$key)=@_;
   my $inv=$self->{device}{$key};
   my $nbinv=$self->{dcache}{$key};
+  #my $nbinv;
   for(keys %{$inv}){
     my $i=$_;
     if(!$nbinv->{$i}){
@@ -351,7 +368,6 @@ sub updatePrimaryIP{
         my $intid=$self->addmgmtinterface();
         my $payload->{address}=$self->{device}{mgmtip}.'/'.$pfret->{bits};
         $payload->{vrf}=$pfret->{vrfid};
-        $payload->{tenant}=$self->{tenantid};
         $payload->{interface}=$intid;
         $ipret=$self->goNetbox('ipam/ip-addresses/','',$payload);
         $self->goNetbox('dcim/devices/',$self->{device}{id},{primary_ip4=>$ipret->{id}});
@@ -377,13 +393,25 @@ sub updateInterfaces{
   my $devints=$self->{device}{interfaces};
   my $nbxints=$self->{dcache}{interfaces};
   $nbxints=$self->getcurrentInterfaces() if !$nbxints;
+  my $vlc=0;
   my @intupdate;
   my @retints;
   my @lags;
   for my $int (keys %{$devints}){
     #$self->info('int:'.$int);
+    $vlc++ if $devints->{$int}{vlans};
     $self->{device}{arpints}=$self->{device}{arpints}+1 if $devints->{$int}{arp};
     $self->{device}{connints}=$self->{device}{connints}+1 if $devints->{$int}{macs} or $devints->{$int}{lldp};
+    if($devints->{$int}{macs}){
+      if($devints->{$int}{formfactor} eq 'LAG'){
+        my $physint=$devints->{$int}{children}[0];
+        my $machold=$devints->{$int}{macs};
+        delete $devints->{$int}{macs};
+        for(@{$machold}){
+          push(@{$devints->{$physint}{macs}},$_);
+        }
+      }
+    }
     my ($devdescr,$nbxdescr,$devip,$nbxip)=('','','','');
     $devdescr=$devints->{$int}{description} if $devints->{$int}{description};
     $nbxdescr=$nbxints->{$int}{description} if $nbxints->{$int}{description};
@@ -406,7 +434,7 @@ sub updateInterfaces{
   }else{
     print("=> Netbox Interfaces updating interfaces: ".$self->{device}{hostname}."\n");
     #$self->getdevvlans();
-    $self->getnbvlans();
+    $self->getnbvlans if $vlc>0;
     #add,delete or update interfaces
     #for(keys %{$self->{currentints}}){
     #  my $delret=$self->goNetbox('dcim/interfaces/',$self->{currentints}{$_},'delete');
@@ -478,7 +506,6 @@ sub addvlan{
     my $payload->{site}=$self->{siteid};
     $payload->{vid}=$vl;
     $payload->{name}="not found";
-    $payload->{tenant}=$self->{tenantid};
     my $vlret=$self->goNetbox('ipam/vlans/','',$payload);
     my $vlid=$vlret->{id};
     $self->{nbvlanhash}{$vl}=$vlid;
@@ -583,6 +610,25 @@ sub getHighestPrefix{
   return $ret;
 }
 
+sub prefixFromStatic{
+  my $self = shift;
+  $self->info('adding static routes...');
+  for(@{$self->{device}{statics}}){
+    my ($net,$bits)=($_->{net},$_->{bits});
+    my $pfret=$self->goNetbox('ipam/prefixes/?contains='.$_->{net}.'&mask_length='.$_->{bits});
+    if($pfret->{count}<1){
+      my $payload->{prefix}=$net.'/'.$bits;
+      $payload->{site}=$self->{siteid};
+      #$payload->{vrf}=$self->{device}{interfaces}{$int}{vrfid};
+      #$payload->{vlan}=$vlanid if $vlanid;
+      $payload->{description}='from static on '.$self->{device}{hostname};
+      $payload->{is_pool}='true';
+      my $ret=$self->goNetbox('ipam/prefixes/','',$payload);
+      push(@{$self->{error}{warning}},'ERROR: updating prefix:'.$net) if !$ret->{id};
+    }
+  }
+}
+
 sub getPrefix{
   my ($self,$int,$ip) = @_;
   my $bits=$ip->{bits};
@@ -609,7 +655,6 @@ sub getPrefix{
         my $payload->{prefix}=$net.'/'.$bits;
         $payload->{site}=$self->{siteid};
         $payload->{vrf}=$self->{device}{interfaces}{$int}{vrfid};
-        $payload->{tenant}=$self->{tenantid};
         $payload->{vlan}=$vlanid if $vlanid;
         $payload->{description}='isprefix';
         $payload->{is_pool}='true';
@@ -637,7 +682,6 @@ sub getVRFid{
     my $rd=$intid.':'.$self->{siteid};
     $payload->{name}=$vrfname;
     $payload->{rd}=$rd;
-    $payload->{tenant}=$self->{tenantid};
     $payload->{enforce_unique}='true';
   }
   my $ret=$self->goNetbox('ipam/vrfs/?q='.$vrfname);
@@ -747,6 +791,20 @@ sub updateNats{
   #print Dumper $natobj;
   print('=> NAT updated in '.sprintf("%.2fs\n", tv_interval ($t0)));
 }
+sub fixARP{
+  my ($self,$iplist)=@_;
+  my $na=0;
+  for(@{$iplist}){
+    print Dumper $_;
+    $na++ if $_->{description} !~/^ARP for.*/;
+  }
+  if($na>0){
+    for(@{$iplist}){
+      $self->info('adding to currentarp:'.$_->{address}.':'.$_->{id}) if $_->{description} =~/^ARP for.*/;
+      push(@{$self->{delarp}},$_->{id}) if $_->{description} =~/^ARP for.*/;
+    }
+  }
+}
 
 sub updateIP{
   my ($self,$int,$i,$ip)=@_;
@@ -757,19 +815,23 @@ sub updateIP{
   if($i->{vrfid}){
     my $payload->{address}=$ipbits;;
     $payload->{vrf}=$i->{vrfid};
-    $payload->{tenant}=$self->{tenantid};
     $payload->{status}=1;
     $payload->{role}=41 if $ip->{type} eq 'vrrp';
-    my $ipq='address='.$ipbits;
-    $ipq.='&vrf_id='.$i->{vrfid};
+    my $ipq='address='.$ipbits.'&vrf_id='.$i->{vrfid};
+    $ipq='address='.$ip->{ip} if $ip->{type} eq 'arp';
     $payload='delete' if $i->{delete};
     my $ipid;
-    my $ipret=$self->goNetbox('ipam/ip-addresses/?'.$ipq)->{results}[0];
+    my $ipinfo=$self->goNetbox('ipam/ip-addresses/?'.$ipq);
+    my $ipret=$ipinfo->{results}[0];
     $ipid=$ipret->{id} if $ipret;
-    if($ip->{type} eq 'arp' && !$ipid){
-      $payload->{description}='ARP for '.$self->{device}{hostname}.' '.$int;
-      $ipret=$self->goNetbox('ipam/ip-addresses/',$ipid,$payload);
-      push(@{$self->{device}{arpadded}},$ipret->{id});
+    if($ip->{type} eq 'arp'){
+      if(!$ipid){
+        $payload->{description}='ARP for '.$self->{device}{hostname}.' '.$int;
+        $ipret=$self->goNetbox('ipam/ip-addresses/',$ipid,$payload);
+        push(@{$self->{device}{arpadded}},$ipret->{id});
+      }elsif($ipinfo->{count}>1){
+        $self->fixARP($ipinfo->{results});
+      }
     }elsif($ip->{type} eq 'nat' && !$ipid){
       $payload->{description}='NAT for '.$i->{description};
       $ipret=$self->goNetbox('ipam/ip-addresses/',$ipid,$payload);
@@ -818,6 +880,7 @@ sub buildconnhash{
       }
     }
   }
+  #print Dumper $self->{connhash};
   $self->info('conhash built');
 }
 
@@ -838,6 +901,7 @@ sub _addconn{
 sub _removeint{
   my ($self,$int)=@_;
   for(keys %{$self->{connhash}}){
+    $self->info("int: $int connhold: $_") if $_=~/^$int:/;
     $self->{connhold}{$_}='hold' if $_=~/^$int:/;
   }
 }
@@ -893,7 +957,6 @@ sub updateConnections{
   }
   my $delhold;
   my $ch=$self->{connhash};
-
   for(keys %{$ch}){
     if(!$delhold->{$ch->{$_}}){
       $delhold->{$ch->{$_}}='deleted';
@@ -941,6 +1004,7 @@ sub connectLLDP{
   my $t0 = [gettimeofday];
   my $connhash=$self->{connhash};
   my $ints=$self->{device}{interfaces};
+  $self->info('working lldp on '.$int);
   for(@{$ints->{$int}{lldp}}){
     my $rh=$_->{rh};
     my $ri=$_->{ri};
@@ -989,10 +1053,15 @@ sub connectMACs{
   for(@{$ints->{$int}{macs}}){
     my $mac=$_;
     $self->info("int:$int mac:$mac\n");
-    my $nbmacinfo=$self->goNetbox('dcim/interfaces/?mac_address='.$mac)->{results}[0];
-    my $nbmacid=$nbmacinfo->{id};
-    if($nbmacid){
-      my ($rh,$ri)=($nbmacinfo->{device}{name},$nbmacinfo->{name});
+    my $macresults=$self->goNetbox('dcim/interfaces/?mac_address='.$mac)->{results};
+    my $nbmacinfo={};
+    for(@{$macresults}){
+      if($_->{device}{name} && !$_->{cable}){
+        $nbmacinfo=$_;
+      }
+    }
+    my ($nbmacid,$rh,$ri)=($nbmacinfo->{id},$nbmacinfo->{device}{name},$nbmacinfo->{name});
+    if($nbmacid && $rh){
       my $key=$int.':'.$rh.':'.$ri;
       my $altrh=_sub($rh);
       my $altkey=$int.':'.$altrh.':'.$ri;
@@ -1024,6 +1093,7 @@ sub updateARP{
   my $self = shift;
   my $t0 = [gettimeofday];
   $self->currentArp();
+  $self->{delarp}=[];
   my $ints=$self->{device}{interfaces};
   my $cints=$self->{dcache}{interfaces};
   for(keys %{$ints}){
@@ -1067,6 +1137,9 @@ sub updateARP{
   }
   for(keys %{$self->{currentarp}}){
     $self->goNetbox('ipam/ip-addresses/',$self->{currentarp}{$_},'delete');
+  }
+  for(@{$self->{delarp}}){
+    $self->goNetbox('ipam/ip-addresses/',$_,'delete');
   }
   print('=> ARP updated in '.sprintf("%.2fs\n", tv_interval ($t0)));
 }
@@ -1126,6 +1199,7 @@ sub buildffdict{
   $ffdict{'1000BASESX SFP'}=1100;
   $ffdict{'SFP1G-LX10'}=1100;
   $ffdict{'SFP-1G-SX'}=1100;
+  $ffdict{'SFP1G-SX-85'}=1100;
   $ffdict{'GLC-T-LU'}=1100;
   $ffdict{'XFP10GBASE-LR'}=1300;
   $ffdict{'XFP10GBASE-SR'}=1300;
@@ -1146,6 +1220,9 @@ sub buildffdict{
   $ffdict{'QSFP+-40G-LR4'}=1400;
   $ffdict{'QSFP40GBASE-SR4'}=1400;
   $ffdict{'QSFP40GBASE-LR4'}=1400;
+  $ffdict{'QSFP-40G-SR4'}=1400;
+  $ffdict{'QSFP-LR4-40G'}=1400;
+  $ffdict{'QSFP-SR4-40G'}=1400;
   $ffdict{'Q-4SPC03'}=1400;
   $ffdict{'QSFP28100GBASE-LR4'}=1600;
   $ffdict{'QSFP28100GBASE-LR4-LITE'}=1600;
@@ -1154,14 +1231,25 @@ sub buildffdict{
   $ffdict{'QSFP-100G-SR4'}=1600;
   $ffdict{'QSFP-100G-CWDM4'}=1600;
   $ffdict{'QSFP-100G-LR4'}=1600;
+  $ffdict{'QSFP28-LR4-100G'}=1600;
+  $ffdict{'QSFP28-SR4-100G'}=1600;
+  $ffdict{'CAB-Q-Q-100G-1M'}=1600;
+  $ffdict{'CAB-Q-Q-100G-5M'}=1600;
+  $ffdict{'SM100G-SR'}=1600;
   $ffdict{'SFP+10G-ER'}=1200;
   $ffdict{'SFP+10G-LR'}=1200;
   $ffdict{'SFP+10G-SR'}=1200;
   $ffdict{'SFP-10G-SR'}=1200;
   $ffdict{'SFP-10G-SRL'}=1200;
+  $ffdict{'SFP+10GBASE-CU4M'}=1200;
+  $ffdict{'616740003'}=1200;
+  $ffdict{'4WJ41'}=1200;
   $ffdict{'SFP-10G-LR'}=1200;
   $ffdict{'SFPP30-03'}=1200;
   $ffdict{'SFPP30-02.5'}=1200;
+  $ffdict{'SFP-10GLR-31'}=1200;
+  $ffdict{'SFP-10GSR-85'}=1200;
+  $ffdict{'SFPP30-01.5'}=1200;
   $ffdict{'CAB-SFP-SFP-3M'}=1200;
   $ffdict{'CAB-SFP-SFP-2.5M'}=1200;
   $ffdict{'CAB-SFP-SFP-1.5M'}=1200;
